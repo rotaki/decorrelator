@@ -23,8 +23,9 @@ pub struct OptimizerCtx {
 
 impl OptimizerCtx {
     pub fn new(id_to_col_name: Rc<RefCell<HashMap<usize, String>>>) -> Self {
+        let start_id = 1000;
         OptimizerCtx {
-            next_id: Rc::new(RefCell::new(0)),
+            next_id: Rc::new(RefCell::new(start_id)),
             enabled_rules: Rc::new(RefCell::new(HashSet::new())),
             id_to_col_name,
         }
@@ -93,6 +94,27 @@ impl std::fmt::Display for BinaryOp {
             BinaryOp::Ge => write!(f, ">="),
             BinaryOp::And => write!(f, "&&"),
             BinaryOp::Or => write!(f, "||"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub enum AggOp {
+    Sum,
+    Count,
+    Avg,
+    Min,
+    Max,
+}
+
+impl std::fmt::Display for AggOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggOp::Sum => write!(f, "sum"),
+            AggOp::Count => write!(f, "count"),
+            AggOp::Avg => write!(f, "avg"),
+            AggOp::Min => write!(f, "min"),
+            AggOp::Max => write!(f, "max"),
         }
     }
 }
@@ -179,7 +201,17 @@ impl Expr {
         }
     }
 
-    pub fn print(&self, indent: usize, out: &mut String) {
+    pub fn pretty_print(&self) {
+        println!("{}", self.pretty_string());
+    }
+
+    pub fn pretty_string(&self) -> String {
+        let mut out = String::new();
+        self.print_inner(0, &mut out);
+        out
+    }
+
+    fn print_inner(&self, indent: usize, out: &mut String) {
         match self {
             Expr::ColRef { id } => {
                 out.push_str(&format!("@{}", id));
@@ -188,13 +220,13 @@ impl Expr {
                 out.push_str(&format!("{}", val));
             }
             Expr::Binary { op, left, right } => {
-                left.print(indent, out);
+                left.print_inner(indent, out);
                 out.push_str(&format!("{}", op));
-                right.print(indent, out);
+                right.print_inner(indent, out);
             }
             Expr::Subquery { expr } => {
                 out.push_str("λ.(\n");
-                expr.print(indent + 6, out);
+                expr.print_inner(indent + 6, out);
                 out.push_str(&format!("{})", " ".repeat(indent + 4)));
             }
         }
@@ -279,6 +311,15 @@ pub enum RelExpr {
         src: Box<RelExpr>,
         cols: HashSet<usize>,
     },
+    OrderBy {
+        src: Box<RelExpr>,
+        cols: Vec<(usize, bool, bool)>, // (column_id, asc, nulls_first)
+    },
+    Aggregate {
+        src: Box<RelExpr>,
+        group_by: Vec<usize>,
+        aggrs: Vec<(usize, (usize, AggOp))>, // (dest_column_id, (src_column_id, agg_op)
+    },
     Map {
         // Appends new columns to the result
         input: Box<RelExpr>,
@@ -299,24 +340,43 @@ impl RelExpr {
         }
     }
 
-    pub fn select(self, mut predicates: Vec<Expr>) -> RelExpr {
-        if let RelExpr::Select {
-            src,
-            predicates: mut preds,
-        } = self
-        {
-            preds.append(&mut predicates);
-            return src.select(preds);
+    pub fn select(self, predicates: Vec<Expr>) -> RelExpr {
+        if predicates.is_empty() {
+            return self;
         }
-
-        RelExpr::Select {
-            src: Box::new(self),
-            predicates,
+        let mut predicates = predicates
+            .into_iter()
+            .flat_map(|expr| expr.split_conjunction())
+            .collect();
+        match self {
+            RelExpr::Select {
+                src,
+                predicates: mut preds,
+            } => {
+                preds.append(&mut predicates);
+                src.select(preds)
+            }
+            RelExpr::Join {
+                join_type,
+                left,
+                right,
+                predicates: mut preds,
+            } => {
+                preds.append(&mut predicates);
+                left.join(join_type, *right, preds)
+            }
+            _ => RelExpr::Select {
+                src: Box::new(self),
+                predicates,
+            },
         }
     }
 
     pub fn join(self, join_type: JoinType, other: RelExpr, mut predicates: Vec<Expr>) -> RelExpr {
-        // RelExpr::Join {left: Box::new(self), right: Box::new(other), predicates}
+        predicates = predicates
+            .into_iter()
+            .flat_map(|expr| expr.split_conjunction())
+            .collect();
         for i in 0..predicates.len() {
             if matches!(
                 join_type,
@@ -343,6 +403,21 @@ impl RelExpr {
             }
         }
 
+        // If the remaining predicates are bound by the left and right sides
+        // (don't contain any free variables), we can turn the cross join into an inner join.
+        // If they contain free variables, then there is a subquery that needs to be evaluated
+        // for each row of the cross join.
+        if matches!(join_type, JoinType::CrossJoin) && !predicates.is_empty() {
+            let free = predicates
+                .iter()
+                .flat_map(|expr| expr.free())
+                .collect::<HashSet<_>>();
+            let atts = self.att().union(&other.att()).cloned().collect();
+            if free.is_subset(&atts) {
+                return self.join(JoinType::Inner, other, predicates);
+            }
+        }
+
         RelExpr::Join {
             join_type,
             left: Box::new(self),
@@ -352,9 +427,35 @@ impl RelExpr {
     }
 
     pub fn project(self, _opt_ctx: &OptimizerCtx, cols: HashSet<usize>) -> RelExpr {
-        RelExpr::Project {
-            src: Box::new(self),
-            cols,
+        match self {
+            RelExpr::Project {
+                src,
+                cols: existing_cols,
+            } => {
+                if cols.is_subset(&existing_cols) {
+                    src.project(_opt_ctx, cols)
+                } else {
+                    panic!("Can't project columns that are not in the source")
+                }
+            }
+            RelExpr::Map {
+                input,
+                exprs: mut existing_exprs,
+            } => {
+                // Remove the mappings that are not used in the projection.
+                existing_exprs.retain(|(id, _)| cols.contains(id));
+                RelExpr::Project {
+                    src: Box::new(RelExpr::Map {
+                        input,
+                        exprs: existing_exprs,
+                    }),
+                    cols,
+                }
+            }
+            _ => RelExpr::Project {
+                src: Box::new(self),
+                cols,
+            },
         }
     }
 
@@ -379,9 +480,37 @@ impl RelExpr {
             }
         }
 
-        RelExpr::Map {
-            input: Box::new(self),
-            exprs,
+        match self {
+            RelExpr::Map {
+                input,
+                exprs: mut existing_exprs,
+            } => {
+                // If the free variables of the new exprs (exprs) does not intersect with the attrs
+                // of the existing exprs (existing_exprs), then we can push the new exprs to existing_exprs.
+                let atts = existing_exprs
+                    .iter()
+                    .map(|(id, _)| *id)
+                    .collect::<HashSet<_>>();
+                for i in 0..exprs.len() {
+                    let free = exprs[i].1.free();
+                    if free.is_disjoint(&atts) {
+                        existing_exprs.push(exprs.swap_remove(i));
+                        return input.map(opt_ctx, existing_exprs).map(opt_ctx, exprs);
+                    }
+                }
+                // We can't push the new exprs to existing_exprs
+                RelExpr::Map {
+                    input: Box::new(RelExpr::Map {
+                        input,
+                        exprs: existing_exprs,
+                    }),
+                    exprs,
+                }
+            }
+            _ => RelExpr::Map {
+                input: Box::new(self),
+                exprs,
+            },
         }
     }
 
@@ -433,11 +562,11 @@ impl RelExpr {
 
     // After:
     // -------------------------------------------
-    // |Project @1, @2, @4                       |
+    // |  Project @1, @2, @4                     |
     // -------------------------------------------
     //                  |
     // -------------------------------------------
-    // | Map to @4                               |
+    // |  Map to @4                              |
     // |     @lhs_id + @rhs_id                   |
     // -------------------------------------------
     //                  |
@@ -531,6 +660,8 @@ impl RelExpr {
                 // Therefore, we don't need to check the free set of the cols.
                 src.free()
             }
+            RelExpr::OrderBy { src, .. } => src.free(),
+            RelExpr::Aggregate { src, .. } => src.free(),
             RelExpr::Map { input, exprs } => {
                 let mut set = input.free();
                 for (_, expr) in exprs {
@@ -565,7 +696,15 @@ impl RelExpr {
                 set.extend(right.att());
                 set
             }
-            RelExpr::Project { cols, .. } => cols.clone(),
+            RelExpr::Project { cols, .. } => cols.iter().cloned().collect(),
+            RelExpr::OrderBy { src, .. } => src.att(),
+            RelExpr::Aggregate {
+                group_by, aggrs, ..
+            } => {
+                let mut set: HashSet<usize> = group_by.iter().cloned().collect();
+                set.extend(aggrs.iter().map(|(id, _)| *id));
+                set
+            }
             RelExpr::Map { input, exprs } => {
                 let mut set = input.att();
                 set.extend(exprs.iter().map(|(id, _)| *id));
@@ -581,7 +720,17 @@ impl RelExpr {
 }
 
 impl RelExpr {
-    pub fn print(&self, indent: usize, out: &mut String) {
+    pub fn pretty_print(&self) {
+        println!("{}", self.pretty_string());
+    }
+
+    pub fn pretty_string(&self) -> String {
+        let mut out = String::new();
+        self.print_inner(0, &mut out);
+        out
+    }
+
+    fn print_inner(&self, indent: usize, out: &mut String) {
         match self {
             RelExpr::Scan {
                 table_name,
@@ -597,11 +746,11 @@ impl RelExpr {
                 let mut split = "";
                 for pred in predicates {
                     out.push_str(split);
-                    pred.print(0, out);
+                    pred.print_inner(0, out);
                     split = " && ";
                 }
                 out.push_str(")\n");
-                src.print(indent + 2, out);
+                src.print_inner(indent + 2, out);
             }
             RelExpr::Join {
                 join_type,
@@ -609,36 +758,63 @@ impl RelExpr {
                 right,
                 predicates,
             } => {
-                out.push_str(&format!("{}-> {}_join(", join_type, " ".repeat(indent)));
+                out.push_str(&format!("{}-> {}_join(", " ".repeat(indent), join_type));
                 let mut split = "";
                 for pred in predicates {
                     out.push_str(split);
-                    pred.print(0, out);
+                    pred.print_inner(0, out);
                     split = " && ";
                 }
                 out.push_str(")\n");
-                left.print(indent + 2, out);
-                right.print(indent + 2, out);
+                left.print_inner(indent + 2, out);
+                right.print_inner(indent + 2, out);
             }
             RelExpr::Project { src, cols } => {
                 out.push_str(&format!("{}-> project({:?})\n", " ".repeat(indent), cols));
-                src.print(indent + 2, out);
+                src.print_inner(indent + 2, out);
+            }
+            RelExpr::OrderBy { src, cols } => {
+                out.push_str(&format!("{}-> order_by({:?})\n", " ".repeat(indent), cols));
+                src.print_inner(indent + 2, out);
+            }
+            RelExpr::Aggregate {
+                src,
+                group_by,
+                aggrs,
+            } => {
+                out.push_str(&format!("{}-> aggregate(\n", " ".repeat(indent)));
+                out.push_str(&format!(
+                    "{}    group_by: {:?},\n",
+                    " ".repeat(indent),
+                    group_by
+                ));
+                for (id, (input_id, op)) in aggrs {
+                    out.push_str(&format!(
+                        "{}    @{} <- {}(@{})\n",
+                        " ".repeat(indent),
+                        id,
+                        op,
+                        input_id
+                    ));
+                }
+                out.push_str(&format!("{})\n", " ".repeat(indent + 2)));
+                src.print_inner(indent + 2, out);
             }
             RelExpr::Map { input, exprs } => {
                 out.push_str(&format!("{}-> map(\n", " ".repeat(indent)));
                 for (id, expr) in exprs {
                     out.push_str(&format!("{}    @{} <- ", " ".repeat(indent), id));
-                    expr.print(indent, out);
+                    expr.print_inner(indent, out);
                     out.push_str(",\n");
                 }
                 out.push_str(&format!("{})\n", " ".repeat(indent + 2)));
-                input.print(indent + 2, out);
+                input.print_inner(indent + 2, out);
             }
             RelExpr::FlatMap { input, func } => {
                 out.push_str(&format!("{}-> flatmap\n", " ".repeat(indent)));
-                input.print(indent + 2, out);
+                input.print_inner(indent + 2, out);
                 out.push_str(&format!("{}  λ.{:?}\n", " ".repeat(indent), func.free()));
-                func.print(indent + 2, out);
+                func.print_inner(indent + 2, out);
             }
         }
     }
@@ -698,7 +874,7 @@ fn main() {
     // );
 
     let mut out = String::new();
-    v.print(0, &mut out);
+    v.print_inner(0, &mut out);
 
     println!("{}", out);
 }

@@ -1,4 +1,8 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    cell::RefCell,
+    collections::{HashMap, HashSet},
+    rc::Rc,
+};
 
 pub enum DataType {
     Int,
@@ -11,11 +15,25 @@ pub struct Column {
     pub data_type: DataType,
 }
 
+impl Column {
+    pub fn new(name: &str, data_type: DataType) -> ColumnRef {
+        Rc::new(Column {
+            name: name.to_string(),
+            data_type,
+        })
+    }
+}
+
 pub type ColumnRef = Rc<Column>;
 
 pub struct Schema {
-    pub name: String,
     pub columns: Vec<ColumnRef>,
+}
+
+impl Schema {
+    pub fn new(columns: Vec<ColumnRef>) -> SchemaRef {
+        Rc::new(Schema { columns })
+    }
 }
 
 pub type SchemaRef = Rc<Schema>;
@@ -25,10 +43,19 @@ pub struct Table {
     pub schema: SchemaRef,
 }
 
+impl Table {
+    pub fn new(name: &str, schema: SchemaRef) -> TableRef {
+        Rc::new(Table {
+            name: name.to_string(),
+            schema,
+        })
+    }
+}
+
 pub type TableRef = Rc<Table>;
 
 pub struct Catalog {
-    col_ids: Rc<RefCell<HashMap<usize, String>>>,
+    col_ids: Rc<RefCell<HashMap<usize, String>>>, // id -> table_name.column_name
     tables: RefCell<Vec<TableRef>>,
 }
 
@@ -40,13 +67,13 @@ impl Catalog {
         }
     }
 
-    pub fn add_table(&self, table: Table) {
+    pub fn add_table(&self, table: TableRef) {
         let current_id = self.col_ids.borrow().len();
         for (i, col) in table.schema.columns.iter().enumerate() {
             let name = format!("{}.{}", table.name, col.name);
             self.col_ids.borrow_mut().insert(current_id + i, name);
         }
-        self.tables.borrow_mut().push(Rc::new(table));
+        self.tables.borrow_mut().push(table);
     }
 
     pub fn get_table(&self, table_name: &str) -> Option<TableRef> {
@@ -79,22 +106,24 @@ impl Catalog {
             .unwrap_or(false)
     }
 
-    pub fn find_column(&self, column_name: &str) -> Option<(TableRef, ColumnRef)> {
+    pub fn find_column(&self, column_name: &str) -> Vec<(TableRef, ColumnRef)> {
+        let mut result = vec![];
         for table in self.tables.borrow().iter() {
             for column in table.schema.columns.iter() {
                 if column.name == column_name {
-                    return Some((table.clone(), column.clone()));
+                    result.push((table.clone(), column.clone()));
                 }
             }
         }
-        None
+        result
     }
 
     pub fn get_col_ids(&self) -> Rc<RefCell<HashMap<usize, String>>> {
         self.col_ids.clone()
     }
 
-    pub fn get_col_ids_of_table(&self, table_name: &str) -> Vec<usize> {
+    // Input: Table name
+    pub fn get_col_ids_of_table(&self, table_name: &str) -> HashSet<usize> {
         self.col_ids
             .borrow()
             .iter()
@@ -108,6 +137,7 @@ impl Catalog {
             .collect()
     }
 
+    // Input: Disambiguated column name (table_name.column_name)
     pub fn get_col_id(&self, name: &str) -> Option<usize> {
         self.col_ids
             .borrow()
