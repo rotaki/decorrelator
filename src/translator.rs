@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    vec,
+};
 
 use crate::{
     catalog::CatalogRef,
@@ -184,6 +187,8 @@ impl Translator {
         distinct: &Option<sqlparser::ast::Distinct>,
     ) -> Result<RelExpr, TranslatorError> {
         let mut projected_cols = HashSet::new();
+        let mut aggregations = Vec::new();
+        let mut maps = Vec::new();
         for item in projection {
             match item {
                 sqlparser::ast::SelectItem::Wildcard(_) => {
@@ -193,29 +198,87 @@ impl Translator {
                     }
                 }
                 sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
-                    let expr = self.process_expr(expr)?;
-                    let col_id = if let Expr::ColRef { id } = expr {
-                        id
+                    if !has_agg(expr) {
+                        let expr = self.process_expr(expr)?;
+                        let col_id = if let Expr::ColRef { id } = expr {
+                            id
+                        } else {
+                            // create a new col_id for the expression
+                            let col_id = self.opt_ctx.next();
+                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            col_id
+                        };
+                        projected_cols.insert(col_id);
                     } else {
-                        // create a new col_id for the expression
-                        let col_id = self.opt_ctx.next();
-                        plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
-                        col_id
-                    };
-                    projected_cols.insert(col_id);
+                        // The most complicated case will be:
+                        // Agg(a + b) + Agg(c + d) + 4
+                        // if we ignore nested aggregation.
+                        //
+                        // In this case,
+                        // Level1: | map a + b to col_id1
+                        //         | map c + d to col_id2
+                        // Level2: |Agg(col_id1) to col_id3
+                        //         |Agg(col_id2) to col_id4
+                        // Level3: |map col_id3 + col_id4 + 4 to col_id5
+
+                        let mut aggs = Vec::new();
+                        let res = self.process_aggregation_arguments(plan, expr, &mut aggs);
+                        plan = res.0;
+                        let expr = res.1;
+                        let col_id = if let Expr::ColRef { id } = expr {
+                            id
+                        } else {
+                            // create a new col_id for the expression
+                            let col_id = self.opt_ctx.next();
+                            maps.push((col_id, expr));
+                            col_id
+                        };
+                        aggregations.append(&mut aggs);
+                        projected_cols.insert(col_id);
+                    }
                 }
                 sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
                     // create a new col_id for the expression
-                    let expr = self.process_expr(expr)?;
-                    let col_id = if let Expr::ColRef { id } = expr {
-                        id
+                    let col_id = if !has_agg(expr) {
+                        let expr = self.process_expr(expr)?;
+                        let col_id = if let Expr::ColRef { id } = expr {
+                            id
+                        } else {
+                            // create a new col_id for the expression
+                            let col_id = self.opt_ctx.next();
+                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            col_id
+                        };
+                        projected_cols.insert(col_id);
+                        col_id
                     } else {
-                        // create a new col_id for the expression
-                        let col_id = self.opt_ctx.next();
-                        plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                        // The most complicated case will be:
+                        // Agg(a + b) + Agg(c + d) + 4
+                        // if we ignore nested aggregation.
+                        //
+                        // In this case,
+                        // Level1: | map a + b to col_id1
+                        //         | map c + d to col_id2
+                        // Level2: |Agg(col_id1) to col_id3
+                        //         |Agg(col_id2) to col_id4
+                        // Level3: |map col_id3 + col_id4 + 4 to col_id5
+
+                        let mut aggs = Vec::new();
+                        let res = self.process_aggregation_arguments(plan, expr, &mut aggs);
+                        plan = res.0;
+                        let expr = res.1;
+                        let col_id = if let Expr::ColRef { id } = expr {
+                            id
+                        } else {
+                            // create a new col_id for the expression
+                            let col_id = self.opt_ctx.next();
+                            maps.push((col_id, expr));
+                            col_id
+                        };
+                        aggregations.append(&mut aggs);
+                        projected_cols.insert(col_id);
                         col_id
                     };
-                    projected_cols.insert(col_id);
 
                     // Add the alias to the aliases map
                     let alias_name = alias.value.clone();
@@ -236,6 +299,33 @@ impl Translator {
                 }
             }
         }
+
+        if !aggregations.is_empty() {
+            let group_by = match group_by {
+                sqlparser::ast::GroupByExpr::All => Err(TranslatorError::UnsupportedSQL(
+                    "GROUP BY ALL is not supported".to_string(),
+                ))?,
+                sqlparser::ast::GroupByExpr::Expressions(exprs) => {
+                    let mut group_by = Vec::new();
+                    for expr in exprs {
+                        let expr = self.process_expr(expr)?;
+                        let col_id = if let Expr::ColRef { id } = expr {
+                            id
+                        } else {
+                            // create a new col_id for the expression
+                            let col_id = self.opt_ctx.next();
+                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            col_id
+                        };
+                        group_by.push(col_id);
+                    }
+                    group_by
+                }
+            };
+            plan = plan.aggregate(group_by, aggregations);
+            plan = self.process_where(plan, having)?;
+        }
+        plan = plan.map(&self.opt_ctx, maps); // This map corresponds to the Level3 in the comment above
         plan = plan.project(&self.opt_ctx, projected_cols);
         Ok(plan)
     }
@@ -399,6 +489,102 @@ impl Translator {
 
         Ok(())
     }
+
+    // DFS until we find an aggregation function
+    // If we find an aggregation function, then add the aggregation argument to the plan
+    // and put the aggregation function in the aggregation list, return the modified plan with the expression.
+    // For example, if SUM(a+b) + AVG(c+d) + 4, then
+    // a+b -> col_id1, c+d -> col_id2 will be added to the plan
+    // SUM(col_id1) -> col_id3, AVG(col_id2) -> col_id4 will be added to the aggregation list
+    // col_id3 + col_id4 + 4 -> col_id5 will be returned with the plan
+    fn process_aggregation_arguments(
+        &self,
+        mut plan: RelExpr,
+        expr: &sqlparser::ast::Expr,
+        aggs: &mut Vec<(usize, (usize, AggOp))>,
+    ) -> (RelExpr, Expr) {
+        match expr {
+            sqlparser::ast::Expr::Identifier(_)
+            | sqlparser::ast::Expr::CompoundIdentifier(_)
+            | sqlparser::ast::Expr::Value(_)
+            | sqlparser::ast::Expr::TypedString { .. } => {
+                let expr = self.process_expr(expr).unwrap();
+                (plan, expr)
+            }
+            sqlparser::ast::Expr::BinaryOp { left, op, right } => {
+                let (plan, left) = self.process_aggregation_arguments(plan, left, aggs);
+                let (plan, right) = self.process_aggregation_arguments(plan, right, aggs);
+                let bin_op = match op {
+                    sqlparser::ast::BinaryOperator::And => BinaryOp::And,
+                    sqlparser::ast::BinaryOperator::Or => BinaryOp::Or,
+                    sqlparser::ast::BinaryOperator::Plus => BinaryOp::Add,
+                    sqlparser::ast::BinaryOperator::Minus => BinaryOp::Sub,
+                    sqlparser::ast::BinaryOperator::Multiply => BinaryOp::Mul,
+                    sqlparser::ast::BinaryOperator::Divide => BinaryOp::Div,
+                    sqlparser::ast::BinaryOperator::Eq => BinaryOp::Eq,
+                    sqlparser::ast::BinaryOperator::NotEq => BinaryOp::Neq,
+                    sqlparser::ast::BinaryOperator::Lt => BinaryOp::Lt,
+                    sqlparser::ast::BinaryOperator::Gt => BinaryOp::Gt,
+                    sqlparser::ast::BinaryOperator::LtEq => BinaryOp::Le,
+                    sqlparser::ast::BinaryOperator::GtEq => BinaryOp::Ge,
+                    _ => unimplemented!("Unsupported binary operator: {:?}", op),
+                };
+                (plan, Expr::binary(bin_op, left, right))
+            }
+            sqlparser::ast::Expr::Function(function) => {
+                let name = get_name(&function.name).to_uppercase();
+                let agg_op = match name.as_str() {
+                    "COUNT" => AggOp::Count,
+                    "SUM" => AggOp::Sum,
+                    "AVG" => AggOp::Avg,
+                    "MIN" => AggOp::Min,
+                    "MAX" => AggOp::Max,
+                    _ => unimplemented!("Unsupported aggregation function: {:?}", function),
+                };
+                if function.args.len() != 1 {
+                    unimplemented!("Unsupported aggregation function: {:?}", function);
+                }
+                let function_arg_expr = match &function.args[0] {
+                    sqlparser::ast::FunctionArg::Named { arg, .. } => arg,
+                    sqlparser::ast::FunctionArg::Unnamed(arg) => arg,
+                };
+
+                let agg_col_id = self.opt_ctx.next();
+                match function_arg_expr {
+                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                        let expr = self.process_expr(&expr).unwrap();
+                        if let Expr::ColRef { id } = expr {
+                            aggs.push((agg_col_id, (id, agg_op)));
+                        } else {
+                            let col_id = self.opt_ctx.next();
+                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            aggs.push((agg_col_id, (col_id, agg_op)));
+                        }
+                        (plan, Expr::col_ref(agg_col_id))
+                    }
+                    sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => {
+                        unimplemented!("QualifiedWildcard is not supported yet")
+                    }
+                    sqlparser::ast::FunctionArgExpr::Wildcard => {
+                        // Wildcard is only supported for COUNT
+                        // If wildcard, just need to return Int(1) as it returns the count of rows
+                        if matches!(agg_op, AggOp::Count) {
+                            let col_id = self.opt_ctx.next();
+                            plan = plan.map(&self.opt_ctx, [(col_id, Expr::int(1))]);
+                            aggs.push((col_id, (col_id, agg_op)));
+                            (plan, Expr::col_ref(col_id))
+                        } else {
+                            panic!("Wildcard is only supported for COUNT");
+                        }
+                    }
+                }
+            }
+            sqlparser::ast::Expr::Nested(expr) => {
+                self.process_aggregation_arguments(plan, expr, aggs)
+            }
+            _ => unimplemented!("Unsupported expression: {:?}", expr),
+        }
+    }
 }
 
 // Helper functions
@@ -412,6 +598,24 @@ fn get_name(name: &sqlparser::ast::ObjectName) -> String {
 
 fn is_valid_alias(alias: &str) -> bool {
     alias.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+fn has_agg(expr: &sqlparser::ast::Expr) -> bool {
+    use sqlparser::ast::Expr::*;
+    match expr {
+        Identifier(_) => false,
+        CompoundIdentifier(_) => false,
+        Value(_) => false,
+        TypedString { .. } => false,
+
+        BinaryOp { left, op: _, right } => has_agg(left) || has_agg(right),
+        Function(function) => match get_name(&function.name).to_uppercase().as_str() {
+            "COUNT" | "SUM" | "AVG" | "MIN" | "MAX" => true,
+            _ => false,
+        },
+        Nested(expr) => has_agg(expr),
+        _ => unimplemented!("Unsupported expression: {:?}", expr),
+    }
 }
 
 #[cfg(test)]
@@ -620,6 +824,28 @@ mod tests {
     #[test]
     fn parse_projection_7() {
         let sql = "SELECT a, b FROM t2";
+        let query = parse_sql(sql);
+
+        let catalog = Rc::new(get_test_catalog());
+        let mut translator = Translator::new(catalog);
+        let plan = translator.process_query(&query).unwrap();
+        plan.pretty_print();
+    }
+
+    #[test]
+    fn parse_aggregation_1() {
+        let sql = "SELECT COUNT(a), SUM(b), AVG(a + b), MIN(a - b), MAX(a * b) FROM t1";
+        let query = parse_sql(sql);
+
+        let catalog = Rc::new(get_test_catalog());
+        let mut translator = Translator::new(catalog);
+        let plan = translator.process_query(&query).unwrap();
+        plan.pretty_print();
+    }
+
+    #[test]
+    fn parse_aggregation_2() {
+        let sql = "SELECT COUNT(*) + SUM(a + 4) + 4, AVG(b) FROM t1";
         let query = parse_sql(sql);
 
         let catalog = Rc::new(get_test_catalog());
