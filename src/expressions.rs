@@ -365,6 +365,20 @@ impl RelExpr {
                 preds.append(&mut predicates);
                 left.join(join_type, *right, preds)
             }
+            RelExpr::Aggregate {
+                src,
+                group_by,
+                aggrs,
+            } => {
+                // If the predicate is bound by the group by columns, we can push it to the source
+                let group_by_cols: HashSet<_> = group_by.iter().cloned().collect();
+                let (push_down, keep): (Vec<_>, Vec<_>) = predicates
+                    .into_iter()
+                    .partition(|pred| pred.free().is_subset(&group_by_cols));
+                src.select(push_down)
+                    .aggregate(group_by, aggrs)
+                    .select(keep)
+            }
             _ => RelExpr::Select {
                 src: Box::new(self),
                 predicates,

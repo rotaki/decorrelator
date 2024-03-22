@@ -643,6 +643,13 @@ mod tests {
                 Column::new("b", DataType::Int),
             ]),
         ));
+        catalog.add_table(Table::new(
+            "t3",
+            Schema::new(vec![
+                Column::new("c", DataType::Int),
+                Column::new("d", DataType::Int),
+            ]),
+        ));
         catalog
     }
 
@@ -846,6 +853,29 @@ mod tests {
     #[test]
     fn parse_aggregation_2() {
         let sql = "SELECT COUNT(*) + SUM(a + 4) + 4, AVG(b) FROM t1";
+        let query = parse_sql(sql);
+
+        let catalog = Rc::new(get_test_catalog());
+        let mut translator = Translator::new(catalog);
+        let plan = translator.process_query(&query).unwrap();
+        plan.pretty_print();
+    }
+
+    #[test]
+    fn parse_aggregation_3() {
+        let sql =
+            "SELECT COUNT(*) + SUM(a + 4) + 4, AVG(b) FROM t1 GROUP BY a, b HAVING a > 1 AND b < 2";
+        let query = parse_sql(sql);
+
+        let catalog = Rc::new(get_test_catalog());
+        let mut translator = Translator::new(catalog);
+        let plan = translator.process_query(&query).unwrap();
+        plan.pretty_print();
+    }
+
+    #[test]
+    fn parse_aggregation_4() {
+        let sql = "SELECT COUNT(*) + SUM(a + d + 3) + 4, AVG(b) FROM t1, t3 GROUP BY a, b HAVING a > 1 AND b < 2";
         let query = parse_sql(sql);
 
         let catalog = Rc::new(get_test_catalog());
