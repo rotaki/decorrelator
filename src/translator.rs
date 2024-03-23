@@ -157,7 +157,7 @@ impl Translator {
         // Join all the tables together using cross join
         let mut plan = join_exprs.pop().unwrap();
         for join_expr in join_exprs {
-            plan = plan.join(JoinType::CrossJoin, join_expr, vec![]);
+            plan = plan.join(&self.opt_ctx, JoinType::CrossJoin, join_expr, vec![]);
         }
         Ok(plan)
     }
@@ -169,7 +169,7 @@ impl Translator {
     ) -> Result<RelExpr, TranslatorError> {
         if let Some(expr) = where_clause {
             let expr = self.process_expr(expr)?;
-            Ok(plan.select(vec![expr]))
+            Ok(plan.select(&self.opt_ctx, vec![expr]))
         } else {
             Ok(plan)
         }
@@ -338,7 +338,12 @@ impl Translator {
         for join in &table_with_joins.joins {
             let right = self.process_table_factor(&join.relation)?;
             let (join_type, condition) = self.process_join_operator(&join.join_operator)?;
-            plan = plan.join(join_type, right, condition.into_iter().collect());
+            plan = plan.join(
+                &self.opt_ctx,
+                join_type,
+                right,
+                condition.into_iter().collect(),
+            );
         }
         Ok(plan)
     }

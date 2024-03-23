@@ -63,7 +63,7 @@ impl OptimizerCtx {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum BinaryOp {
     Add,
     Sub,
@@ -98,7 +98,7 @@ impl std::fmt::Display for BinaryOp {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AggOp {
     Sum,
     Count,
@@ -119,7 +119,7 @@ impl std::fmt::Display for AggOp {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Expr {
     ColRef {
         id: usize,
@@ -268,7 +268,7 @@ impl Expr {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum JoinType {
     Inner,
     LeftOuter,
@@ -289,7 +289,7 @@ impl std::fmt::Display for JoinType {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum RelExpr {
     Scan {
         table_name: String,
@@ -340,7 +340,7 @@ impl RelExpr {
         }
     }
 
-    pub fn select(self, predicates: Vec<Expr>) -> RelExpr {
+    pub fn select(self, opt_ctx: &OptimizerCtx, predicates: Vec<Expr>) -> RelExpr {
         if predicates.is_empty() {
             return self;
         }
@@ -354,7 +354,7 @@ impl RelExpr {
                 predicates: mut preds,
             } => {
                 preds.append(&mut predicates);
-                src.select(preds)
+                src.select(opt_ctx, preds)
             }
             RelExpr::Join {
                 join_type,
@@ -363,7 +363,7 @@ impl RelExpr {
                 predicates: mut preds,
             } => {
                 preds.append(&mut predicates);
-                left.join(join_type, *right, preds)
+                left.join(opt_ctx, join_type, *right, preds)
             }
             RelExpr::Aggregate {
                 src,
@@ -375,9 +375,20 @@ impl RelExpr {
                 let (push_down, keep): (Vec<_>, Vec<_>) = predicates
                     .into_iter()
                     .partition(|pred| pred.free().is_subset(&group_by_cols));
-                src.select(push_down)
+                src.select(opt_ctx, push_down)
                     .aggregate(group_by, aggrs)
-                    .select(keep)
+                    .select(opt_ctx, keep)
+            }
+            RelExpr::Map { input, exprs } => {
+                // If the predicate does not intersect with the atts of exprs, we can push it to the source
+                let atts = exprs.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+                let (push_down, keep): (Vec<_>, Vec<_>) = predicates
+                    .into_iter()
+                    .partition(|pred| pred.free().is_disjoint(&atts));
+                input
+                    .select(opt_ctx, push_down)
+                    .map(opt_ctx, exprs)
+                    .select(opt_ctx, keep)
             }
             _ => RelExpr::Select {
                 src: Box::new(self),
@@ -386,34 +397,49 @@ impl RelExpr {
         }
     }
 
-    pub fn join(self, join_type: JoinType, other: RelExpr, mut predicates: Vec<Expr>) -> RelExpr {
+    pub fn join(
+        self,
+        opt_ctx: &OptimizerCtx,
+        join_type: JoinType,
+        other: RelExpr,
+        mut predicates: Vec<Expr>,
+    ) -> RelExpr {
         predicates = predicates
             .into_iter()
             .flat_map(|expr| expr.split_conjunction())
             .collect();
-        for i in 0..predicates.len() {
-            if matches!(
+
+        if !predicates.is_empty()
+            && matches!(
                 join_type,
                 JoinType::Inner | JoinType::LeftOuter | JoinType::CrossJoin
-            ) {
-                if predicates[i].bound_by(&self) {
-                    // We can push this predicate to the left side
-                    let predicate = predicates.swap_remove(i);
-                    return self
-                        .select(vec![predicate])
-                        .join(join_type, other, predicates);
-                }
+            )
+        {
+            let (push_down, keep): (Vec<_>, Vec<_>) =
+                predicates.iter().partition(|pred| pred.bound_by(&self));
+            if !push_down.is_empty() {
+                // This condition is necessary to avoid infinite recursion
+                let push_down = push_down.into_iter().map(|expr| expr.clone()).collect();
+                let keep = keep.into_iter().map(|expr| expr.clone()).collect();
+                return self
+                    .select(opt_ctx, push_down)
+                    .join(opt_ctx, join_type, other, keep);
             }
+        }
 
-            if matches!(
+        if !predicates.is_empty()
+            && matches!(
                 join_type,
                 JoinType::Inner | JoinType::RightOuter | JoinType::CrossJoin
-            ) {
-                if predicates[i].bound_by(&other) {
-                    // We can push this predicate to the right side
-                    let predicate = predicates.swap_remove(i);
-                    return self.join(join_type, other.select(vec![predicate]), predicates);
-                }
+            )
+        {
+            let (push_down, keep): (Vec<_>, Vec<_>) =
+                predicates.iter().partition(|pred| pred.bound_by(&other));
+            if !push_down.is_empty() {
+                // This condition is necessary to avoid infinite recursion
+                let push_down = push_down.into_iter().map(|expr| expr.clone()).collect();
+                let keep = keep.into_iter().map(|expr| expr.clone()).collect();
+                return self.join(opt_ctx, join_type, other.select(opt_ctx, push_down), keep);
             }
         }
 
@@ -428,7 +454,7 @@ impl RelExpr {
                 .collect::<HashSet<_>>();
             let atts = self.att().union(&other.att()).cloned().collect();
             if free.is_subset(&atts) {
-                return self.join(JoinType::Inner, other, predicates);
+                return self.join(opt_ctx, JoinType::Inner, other, predicates);
             }
         }
 
@@ -513,21 +539,11 @@ impl RelExpr {
                     .iter()
                     .map(|(id, _)| *id)
                     .collect::<HashSet<_>>();
-                for i in 0..exprs.len() {
-                    let free = exprs[i].1.free();
-                    if free.is_disjoint(&atts) {
-                        existing_exprs.push(exprs.swap_remove(i));
-                        return input.map(opt_ctx, existing_exprs).map(opt_ctx, exprs);
-                    }
-                }
-                // We can't push the new exprs to existing_exprs
-                RelExpr::Map {
-                    input: Box::new(RelExpr::Map {
-                        input,
-                        exprs: existing_exprs,
-                    }),
-                    exprs,
-                }
+                let (mut push_down, keep): (Vec<_>, Vec<_>) = exprs
+                    .into_iter()
+                    .partition(|(_, expr)| expr.free().is_disjoint(&atts));
+                existing_exprs.append(&mut push_down);
+                input.map(opt_ctx, existing_exprs).map(opt_ctx, keep)
             }
             _ => RelExpr::Map {
                 input: Box::new(self),
@@ -540,7 +556,7 @@ impl RelExpr {
         if opt_ctx.enabled(Rule::Decorrelate) {
             // Not correlated!
             if func.free().is_empty() {
-                return self.join(JoinType::CrossJoin, func, vec![]);
+                return self.join(opt_ctx, JoinType::CrossJoin, func, vec![]);
             }
 
             // Pull up Project
