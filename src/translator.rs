@@ -1,12 +1,77 @@
 use std::{
+    cell::{Ref, RefCell},
     collections::{HashMap, HashSet},
-    vec,
+    rc::Rc,
 };
 
 use crate::{
-    catalog::CatalogRef,
-    expressions::{AggOp, BinaryOp, Expr, JoinType, OptimizerCtx, RelExpr},
+    catalog::{self, Catalog, CatalogRef},
+    col_id_generator::ColIdGeneratorRef,
+    expressions::{AggOp, BinaryOp, Expr, JoinType, RelExpr},
+    rules::RulesRef,
 };
+
+type EnvironmentRef = Rc<Environment>;
+
+#[derive(Debug, Clone)]
+struct Environment {
+    outer: Option<EnvironmentRef>,
+    columns: RefCell<HashMap<String, usize>>,
+}
+
+impl Environment {
+    fn new() -> Environment {
+        Environment {
+            outer: None,
+            columns: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn new_with_outer(outer: EnvironmentRef) -> Environment {
+        Environment {
+            outer: Some(outer),
+            columns: RefCell::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<usize> {
+        if let Some(index) = self.columns.borrow().get(name) {
+            return Some(*index);
+        }
+
+        if let Some(outer) = &self.outer {
+            return outer.get(name);
+        }
+
+        None
+    }
+
+    fn set(&self, name: &str, index: usize) {
+        self.columns.borrow_mut().insert(name.to_string(), index);
+    }
+
+    fn get_names(&self, col_id: usize) -> Vec<String> {
+        let mut names = Vec::new();
+        for (name, index) in self.columns.borrow().iter() {
+            if *index == col_id {
+                names.push(name.clone());
+            }
+        }
+        names
+    }
+}
+
+struct Translator {
+    catalog_ref: CatalogRef,
+    enabled_rules: RulesRef,
+    col_id_gen: ColIdGeneratorRef,
+    env: EnvironmentRef, // Variables in the current scope
+}
+
+struct Query {
+    env: EnvironmentRef,
+    plan: RelExpr,
+}
 
 #[derive(Debug)]
 pub enum TranslatorError {
@@ -16,113 +81,62 @@ pub enum TranslatorError {
     UnsupportedSQL(String),
 }
 
-/// This struct will be used to translate SQL expression into a query plan.
-/// The translator will be responsible for doing the semantic analysis of the SQL expression
-/// and validating the expression.
-pub struct Translator {
-    catalog_ref: CatalogRef,
-    table_aliases: HashMap<String, String>, // table_alias -> table_name
-    column_aliases: HashMap<String, usize>, // column_alias -> col_id
-    referenced_tables: HashSet<String>, // all the tables referenced in the query (FROM, JOIN, Subquery)
-    opt_ctx: OptimizerCtx,
+macro_rules! translation_err {
+    (ColumnNotFound, $($arg:tt)*) => {
+        TranslatorError::ColumnNotFound(format!($($arg)*))
+    };
+    (TableNotFound, $($arg:tt)*) => {
+        TranslatorError::TableNotFound(format!($($arg)*))
+    };
+    (InvalidSQL, $($arg:tt)*) => {
+        TranslatorError::InvalidSQL(format!($($arg)*))
+    };
+    (UnsupportedSQL, $($arg:tt)*) => {
+        TranslatorError::UnsupportedSQL(format!($($arg)*))
+    };
 }
 
 impl Translator {
-    pub fn new(catalog_ref: CatalogRef) -> Self {
-        let opt_ctx = OptimizerCtx::new(catalog_ref.get_col_ids());
+    pub fn new(
+        catalog: &CatalogRef,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
+    ) -> Translator {
         Translator {
-            catalog_ref,
-            table_aliases: HashMap::new(),
-            column_aliases: HashMap::new(),
-            referenced_tables: HashSet::new(),
-            opt_ctx,
+            catalog_ref: catalog.clone(),
+            enabled_rules: enabled_rules.clone(),
+            col_id_gen: col_id_gen.clone(),
+            env: Rc::new(Environment::new()),
         }
     }
 
-    // Input: table_name or alias
-    // Output: table_name
-    fn disambiguate_table_name(&self, name: &str) -> Result<String, TranslatorError> {
-        let name = {
-            if let Some(name) = self.table_aliases.get(name) {
-                // If there is an alias, then we prioritize the alias
-                name
-            } else {
-                name
-            }
-        };
-        if self.catalog_ref.is_valid_table(name) {
-            Ok(name.into())
-        } else {
-            Err(TranslatorError::TableNotFound(name.into()))
-        }
-    }
-
-    // Input: table_name.column_name or alias_table.column_name or column_name or alias_column
-    //        (note that table_name.alias_column, using period in alias_column is not supported)
-    // Output: col_id
-    fn disambiguate_column(&self, name: &str) -> Result<usize, TranslatorError> {
-        // Split the name into parts
-        let parts: Vec<&str> = name.split('.').collect();
-        match parts.len() {
-            1 => {
-                // If there is only one part, then it is the column name or alias
-                if let Some(col_id) = self.column_aliases.get(parts[0]) {
-                    // If there is an alias, then we prioritize the alias
-                    Ok(*col_id)
-                } else {
-                    // We need to find the table name for this column
-                    // We will iterate over all the referenced tables and find the column
-                    for table_name in &self.referenced_tables {
-                        if self.catalog_ref.is_valid_column(table_name, parts[0]) {
-                            let disambiguated_name = format!("{}.{}", table_name, parts[0]);
-                            return Ok(self.catalog_ref.get_col_id(&disambiguated_name).unwrap());
-                        }
-                    }
-                    Err(TranslatorError::ColumnNotFound(format!(
-                        "{} not found in any of the referenced tables",
-                        parts[0]
-                    )))
-                }
-            }
-            2 => {
-                // If there are two parts, then the first part is the alias or table name
-                // and the second part is the column name
-                // We need to find the table name for this alias
-                // If the first part is an alias, then we will use the alias to find the table name
-                // If the first part is a table name, then we will use the table name as is
-                let table_name = self.disambiguate_table_name(parts[0])?;
-                // We need to check if we reference the table in the query
-                // and if the column is valid
-                if self.referenced_tables.contains(&table_name)
-                    && self.catalog_ref.is_valid_column(&table_name, parts[1])
-                {
-                    let disambiguated_name = format!("{}.{}", table_name, parts[1]);
-                    Ok(self.catalog_ref.get_col_id(&disambiguated_name).unwrap())
-                } else {
-                    return Err(TranslatorError::ColumnNotFound(name.to_string()));
-                }
-            }
-            _ => Err(TranslatorError::UnsupportedSQL(format!(
-                "3 or more parts in column name: {}",
-                name
-            ))),
+    fn new_with_outer(
+        catalog: &CatalogRef,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
+        outer: &EnvironmentRef,
+    ) -> Translator {
+        Translator {
+            col_id_gen: col_id_gen.clone(),
+            enabled_rules: enabled_rules.clone(),
+            catalog_ref: catalog.clone(),
+            env: Rc::new(Environment::new_with_outer(outer.clone())),
         }
     }
 
     pub fn process_query(
         &mut self,
         query: &sqlparser::ast::Query,
-    ) -> Result<RelExpr, TranslatorError> {
+    ) -> Result<Query, TranslatorError> {
         let select = match query.body.as_ref() {
-            sqlparser::ast::SetExpr::Select(ref select) => select,
+            sqlparser::ast::SetExpr::Select(select) => select,
             _ => {
-                return Err(TranslatorError::UnsupportedSQL(
-                    "Only SELECT queries are supported".to_string(),
+                return Err(translation_err!(
+                    UnsupportedSQL,
+                    "Only SELECT queries are supported"
                 ))
             }
         };
-
-        self.add_tables_to_referenced_tables(&select.from)?;
 
         let plan = self.process_from(&select.from)?;
         let plan = self.process_where(plan, &select.selection)?;
@@ -137,7 +151,10 @@ impl Translator {
             &select.distinct,
         )?;
 
-        Ok(plan)
+        Ok(Query {
+            env: self.env.clone(),
+            plan,
+        })
     }
 
     fn process_from(
@@ -145,21 +162,163 @@ impl Translator {
         from: &[sqlparser::ast::TableWithJoins],
     ) -> Result<RelExpr, TranslatorError> {
         if from.is_empty() {
-            return Err(TranslatorError::InvalidSQL(
-                "FROM clause is required".to_string(),
-            ));
+            return Err(translation_err!(InvalidSQL, "FROM clause is empty"));
         }
-        let mut join_exprs = vec![];
+
+        let mut join_exprs = Vec::with_capacity(from.len());
         for table_with_joins in from {
             let join_expr = self.process_table_with_joins(table_with_joins)?;
             join_exprs.push(join_expr);
         }
-        // Join all the tables together using cross join
-        let mut plan = join_exprs.pop().unwrap();
-        for join_expr in join_exprs {
-            plan = plan.join(&self.opt_ctx, JoinType::CrossJoin, join_expr, vec![]);
+        let (mut plan, _) = join_exprs.remove(0);
+        for (join_expr, is_subquery) in join_exprs.into_iter() {
+            plan = if is_subquery {
+                plan.flatmap(&self.enabled_rules, &self.col_id_gen, join_expr)
+            } else {
+                plan.join(
+                    &self.enabled_rules,
+                    &self.col_id_gen,
+                    JoinType::CrossJoin,
+                    join_expr,
+                    vec![],
+                )
+            }
         }
         Ok(plan)
+    }
+
+    fn process_table_with_joins(
+        &mut self,
+        table_with_joins: &sqlparser::ast::TableWithJoins,
+    ) -> Result<(RelExpr, bool), TranslatorError> {
+        let (mut plan, is_sbqry) = self.process_table_factor(&table_with_joins.relation)?;
+        for join in &table_with_joins.joins {
+            let (right, is_subquery) = self.process_table_factor(&join.relation)?;
+            // If it is a subquery, we use flat_map + condition
+            // Other wise we use a join
+            let (join_type, condition) = self.process_join_operator(&join.join_operator)?;
+            plan = if is_subquery {
+                if matches!(
+                    join_type,
+                    JoinType::LeftOuter | JoinType::RightOuter | JoinType::FullOuter
+                ) {
+                    return Err(translation_err!(
+                        UnsupportedSQL,
+                        "Unsupported join type with subquery"
+                    ));
+                }
+                plan.flatmap(&self.enabled_rules, &self.col_id_gen, right)
+                    .select(
+                        &self.enabled_rules,
+                        &self.col_id_gen,
+                        condition.into_iter().collect(),
+                    )
+            } else {
+                plan.join(
+                    &self.enabled_rules,
+                    &self.col_id_gen,
+                    join_type,
+                    right,
+                    condition.into_iter().collect(),
+                )
+            }
+        }
+        Ok((plan, is_sbqry))
+    }
+
+    fn process_join_operator(
+        &self,
+        join_operator: &sqlparser::ast::JoinOperator,
+    ) -> Result<(JoinType, Option<Expr>), TranslatorError> {
+        use sqlparser::ast::{JoinConstraint, JoinOperator::*};
+        match join_operator {
+            Inner(JoinConstraint::On(cond)) => {
+                Ok((JoinType::Inner, Some(self.process_expr(cond)?)))
+            }
+            LeftOuter(JoinConstraint::On(cond)) => {
+                Ok((JoinType::LeftOuter, Some(self.process_expr(cond)?)))
+            }
+            RightOuter(JoinConstraint::On(cond)) => {
+                Ok((JoinType::RightOuter, Some(self.process_expr(cond)?)))
+            }
+            FullOuter(JoinConstraint::On(cond)) => {
+                Ok((JoinType::FullOuter, Some(self.process_expr(cond)?)))
+            }
+            CrossJoin => Ok((JoinType::CrossJoin, None)),
+            _ => Err(translation_err!(
+                UnsupportedSQL,
+                "Unsupported join operator: {:?}",
+                join_operator
+            )),
+        }
+    }
+
+    // Out: (RelExpr, is_subquery: bool)
+    fn process_table_factor(
+        &mut self,
+        table_factor: &sqlparser::ast::TableFactor,
+    ) -> Result<(RelExpr, bool), TranslatorError> {
+        match table_factor {
+            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
+                // Find the actual name from the catalog
+                // If name exists in the catalog, then add the columns to the environment
+                // Otherwise return an error
+                let table_name = get_name(name);
+                if self.catalog_ref.is_valid_table(&table_name) {
+                    let cols = self.catalog_ref.get_cols(&table_name);
+
+                    for (col_name, col_id) in &cols {
+                        self.env.set(col_name, *col_id);
+                        self.env
+                            .set(&format!("{}.{}", table_name, col_name), *col_id);
+                    }
+
+                    if let Some(alias) = alias {
+                        if is_valid_alias(&alias.name.value) {
+                            for (col_name, col_id) in &cols {
+                                self.env.set(&format!("{}.{}", alias, col_name), *col_id);
+                            }
+                        }
+                    }
+                    Ok((
+                        RelExpr::Scan {
+                            table_name,
+                            column_names: cols.into_iter().map(|(_, col_id)| col_id).collect(),
+                        },
+                        false,
+                    ))
+                } else {
+                    Err(translation_err!(TableNotFound, "{}", table_name))
+                }
+            }
+            sqlparser::ast::TableFactor::Derived {
+                subquery, alias, ..
+            } => {
+                let mut translator = Translator::new_with_outer(
+                    &self.catalog_ref,
+                    &self.enabled_rules,
+                    &self.col_id_gen,
+                    &self.env,
+                );
+                let subquery = translator.process_query(subquery)?;
+                let att = subquery.plan.att();
+                for i in att {
+                    // get the name of the column from env
+                    let names = subquery.env.get_names(i);
+                    for name in &names {
+                        self.env.set(&name, i);
+                    }
+                    // If there is an alias, set the alias in the current environment
+                    if let Some(alias) = alias {
+                        for name in &names {
+                            self.env.set(&format!("{}.{}", alias, name), i);
+                        }
+                    }
+                }
+                Ok((subquery.plan, true))
+            }
+            _ => Err(translation_err!(UnsupportedSQL, "Unsupported table factor")),
+        }
     }
 
     fn process_where(
@@ -169,7 +328,7 @@ impl Translator {
     ) -> Result<RelExpr, TranslatorError> {
         if let Some(expr) = where_clause {
             let expr = self.process_expr(expr)?;
-            Ok(plan.select(&self.opt_ctx, vec![expr]))
+            Ok(plan.select(&self.enabled_rules, &self.col_id_gen, vec![expr]))
         } else {
             Ok(plan)
         }
@@ -192,9 +351,9 @@ impl Translator {
         for item in projection {
             match item {
                 sqlparser::ast::SelectItem::Wildcard(_) => {
-                    for table_name in &self.referenced_tables {
-                        let col_ids = self.catalog_ref.get_col_ids_of_table(&table_name);
-                        projected_cols.extend(col_ids);
+                    // Add all the environment variables to the projected columns
+                    for (_, col_id) in self.env.columns.borrow().iter() {
+                        projected_cols.insert(*col_id);
                     }
                 }
                 sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
@@ -204,8 +363,9 @@ impl Translator {
                             id
                         } else {
                             // create a new col_id for the expression
-                            let col_id = self.opt_ctx.next();
-                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            let col_id = self.col_id_gen.next();
+                            plan =
+                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
                             col_id
                         };
                         projected_cols.insert(col_id);
@@ -229,7 +389,7 @@ impl Translator {
                             id
                         } else {
                             // create a new col_id for the expression
-                            let col_id = self.opt_ctx.next();
+                            let col_id = self.col_id_gen.next();
                             maps.push((col_id, expr));
                             col_id
                         };
@@ -245,8 +405,9 @@ impl Translator {
                             id
                         } else {
                             // create a new col_id for the expression
-                            let col_id = self.opt_ctx.next();
-                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            let col_id = self.col_id_gen.next();
+                            plan =
+                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
                             col_id
                         };
                         projected_cols.insert(col_id);
@@ -271,7 +432,7 @@ impl Translator {
                             id
                         } else {
                             // create a new col_id for the expression
-                            let col_id = self.opt_ctx.next();
+                            let col_id = self.col_id_gen.next();
                             maps.push((col_id, expr));
                             col_id
                         };
@@ -283,27 +444,30 @@ impl Translator {
                     // Add the alias to the aliases map
                     let alias_name = alias.value.clone();
                     if is_valid_alias(&alias_name) {
-                        self.column_aliases.insert(alias_name, col_id);
+                        self.env.set(&alias_name, col_id);
                     } else {
-                        return Err(TranslatorError::InvalidSQL(format!(
+                        return Err(translation_err!(
+                            InvalidSQL,
                             "Invalid alias name: {}",
                             alias_name
-                        )));
+                        ));
                     }
                 }
                 _ => {
-                    return Err(TranslatorError::UnsupportedSQL(format!(
+                    return Err(translation_err!(
+                        UnsupportedSQL,
                         "Unsupported select item: {:?}",
                         item
-                    )))
+                    ))
                 }
             }
         }
 
         if !aggregations.is_empty() {
             let group_by = match group_by {
-                sqlparser::ast::GroupByExpr::All => Err(TranslatorError::UnsupportedSQL(
-                    "GROUP BY ALL is not supported".to_string(),
+                sqlparser::ast::GroupByExpr::All => Err(translation_err!(
+                    UnsupportedSQL,
+                    "GROUP BY ALL is not supported"
                 ))?,
                 sqlparser::ast::GroupByExpr::Expressions(exprs) => {
                     let mut group_by = Vec::new();
@@ -313,8 +477,9 @@ impl Translator {
                             id
                         } else {
                             // create a new col_id for the expression
-                            let col_id = self.opt_ctx.next();
-                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            let col_id = self.col_id_gen.next();
+                            plan =
+                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
                             col_id
                         };
                         group_by.push(col_id);
@@ -325,174 +490,9 @@ impl Translator {
             plan = plan.aggregate(group_by, aggregations);
             plan = self.process_where(plan, having)?;
         }
-        plan = plan.map(&self.opt_ctx, maps); // This map corresponds to the Level3 in the comment above
-        plan = plan.project(&self.opt_ctx, projected_cols);
+        plan = plan.map(&self.enabled_rules, &self.col_id_gen, maps); // This map corresponds to the Level3 in the comment above
+        plan = plan.project(&self.enabled_rules, projected_cols);
         Ok(plan)
-    }
-
-    fn process_table_with_joins(
-        &mut self,
-        table_with_joins: &sqlparser::ast::TableWithJoins,
-    ) -> Result<RelExpr, TranslatorError> {
-        let mut plan = self.process_table_factor(&table_with_joins.relation)?;
-        for join in &table_with_joins.joins {
-            let right = self.process_table_factor(&join.relation)?;
-            let (join_type, condition) = self.process_join_operator(&join.join_operator)?;
-            plan = plan.join(
-                &self.opt_ctx,
-                join_type,
-                right,
-                condition.into_iter().collect(),
-            );
-        }
-        Ok(plan)
-    }
-
-    fn process_table_factor(
-        &mut self,
-        table_factor: &sqlparser::ast::TableFactor,
-    ) -> Result<RelExpr, TranslatorError> {
-        match table_factor {
-            sqlparser::ast::TableFactor::Table { name, .. } => {
-                let disambiguated_name = self.disambiguate_table_name(&get_name(&name))?;
-                let column_names = self.catalog_ref.get_col_ids_of_table(&disambiguated_name);
-                Ok(RelExpr::Scan {
-                    table_name: disambiguated_name,
-                    column_names: column_names.into_iter().collect(),
-                })
-            }
-            _ => Err(TranslatorError::UnsupportedSQL(format!(
-                "Unsupported table factor: {:?}",
-                table_factor
-            ))),
-        }
-    }
-
-    fn process_join_operator(
-        &self,
-        join_operator: &sqlparser::ast::JoinOperator,
-    ) -> Result<(JoinType, Option<Expr>), TranslatorError> {
-        use sqlparser::ast::{JoinConstraint, JoinOperator::*};
-        match join_operator {
-            Inner(JoinConstraint::On(cond)) => {
-                Ok((JoinType::Inner, Some(self.process_expr(cond)?)))
-            }
-            LeftOuter(JoinConstraint::On(cond)) => {
-                Ok((JoinType::LeftOuter, Some(self.process_expr(cond)?)))
-            }
-            RightOuter(JoinConstraint::On(cond)) => {
-                Ok((JoinType::RightOuter, Some(self.process_expr(cond)?)))
-            }
-            FullOuter(JoinConstraint::On(cond)) => {
-                Ok((JoinType::FullOuter, Some(self.process_expr(cond)?)))
-            }
-            CrossJoin => Ok((JoinType::CrossJoin, None)),
-            _ => Err(TranslatorError::UnsupportedSQL(format!(
-                "Unsupported join operator: {:?}",
-                join_operator
-            ))),
-        }
-    }
-
-    fn process_expr(&self, expr: &sqlparser::ast::Expr) -> Result<Expr, TranslatorError> {
-        match expr {
-            sqlparser::ast::Expr::Identifier(ident) => {
-                let id = self.disambiguate_column(&ident.value)?;
-                Ok(Expr::col_ref(id))
-            }
-            sqlparser::ast::Expr::CompoundIdentifier(idents) => {
-                let name = idents
-                    .iter()
-                    .map(|i| i.value.clone())
-                    .collect::<Vec<_>>()
-                    .join(".");
-                let id = self.disambiguate_column(&name)?;
-                Ok(Expr::col_ref(id))
-            }
-            sqlparser::ast::Expr::BinaryOp { left, op, right } => {
-                use sqlparser::ast::BinaryOperator::*;
-                let left = self.process_expr(left)?;
-                let right = self.process_expr(right)?;
-                let bin_op = match op {
-                    And => BinaryOp::And,
-                    Or => BinaryOp::Or,
-                    Plus => BinaryOp::Add,
-                    Minus => BinaryOp::Sub,
-                    Multiply => BinaryOp::Mul,
-                    Divide => BinaryOp::Div,
-                    Eq => BinaryOp::Eq,
-                    NotEq => BinaryOp::Neq,
-                    Lt => BinaryOp::Lt,
-                    Gt => BinaryOp::Gt,
-                    LtEq => BinaryOp::Le,
-                    GtEq => BinaryOp::Ge,
-                    _ => {
-                        return Err(TranslatorError::UnsupportedSQL(format!(
-                            "Unsupported binary operator: {:?}",
-                            op
-                        )))
-                    }
-                };
-                Ok(Expr::binary(bin_op, left, right))
-            }
-            sqlparser::ast::Expr::Value(value) => match value {
-                sqlparser::ast::Value::Number(num, _) => Ok(Expr::int(num.parse().unwrap())),
-                _ => Err(TranslatorError::UnsupportedSQL(format!(
-                    "Unsupported value: {:?}",
-                    value
-                ))),
-            },
-            _ => Err(TranslatorError::UnsupportedSQL(format!(
-                "Unsupported expression: {:?}",
-                expr
-            ))),
-        }
-    }
-
-    // Add all table names to the referenced_tables set
-    fn add_tables_to_referenced_tables(
-        &mut self,
-        from: &Vec<sqlparser::ast::TableWithJoins>,
-    ) -> Result<(), TranslatorError> {
-        for table_with_joins in from {
-            self.add_table_factor_to_referenced_tables(&table_with_joins.relation)?;
-
-            for join in &table_with_joins.joins {
-                self.add_table_factor_to_referenced_tables(&join.relation)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn add_table_factor_to_referenced_tables(
-        &mut self,
-        table_factor: &sqlparser::ast::TableFactor,
-    ) -> Result<(), TranslatorError> {
-        let table_name = match &table_factor {
-            sqlparser::ast::TableFactor::Table { name, alias, .. } => {
-                let name = get_name(name);
-                // Add the alias to the aliases map
-                if let Some(alias) = alias {
-                    let alias_name = alias.name.value.clone();
-                    if is_valid_alias(&alias_name) {
-                        return Err(TranslatorError::InvalidSQL(format!(
-                            "Invalid alias name: {}",
-                            alias_name
-                        )));
-                    }
-                    self.table_aliases.insert(alias_name, name.clone());
-                }
-                name
-            }
-            _ => Err(TranslatorError::InvalidSQL(format!(
-                "Unsupported table factor: {:?}",
-                table_factor
-            )))?,
-        };
-        let table_name = self.disambiguate_table_name(&table_name)?;
-        self.referenced_tables.insert(table_name);
-
-        Ok(())
     }
 
     // DFS until we find an aggregation function
@@ -554,15 +554,16 @@ impl Translator {
                     sqlparser::ast::FunctionArg::Unnamed(arg) => arg,
                 };
 
-                let agg_col_id = self.opt_ctx.next();
+                let agg_col_id = self.col_id_gen.next();
                 match function_arg_expr {
                     sqlparser::ast::FunctionArgExpr::Expr(expr) => {
                         let expr = self.process_expr(&expr).unwrap();
                         if let Expr::ColRef { id } = expr {
                             aggs.push((agg_col_id, (id, agg_op)));
                         } else {
-                            let col_id = self.opt_ctx.next();
-                            plan = plan.map(&self.opt_ctx, [(col_id, expr)]);
+                            let col_id = self.col_id_gen.next();
+                            plan =
+                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
                             aggs.push((agg_col_id, (col_id, agg_op)));
                         }
                         (plan, Expr::col_ref(agg_col_id))
@@ -574,8 +575,12 @@ impl Translator {
                         // Wildcard is only supported for COUNT
                         // If wildcard, just need to return Int(1) as it returns the count of rows
                         if matches!(agg_op, AggOp::Count) {
-                            let col_id = self.opt_ctx.next();
-                            plan = plan.map(&self.opt_ctx, [(col_id, Expr::int(1))]);
+                            let col_id = self.col_id_gen.next();
+                            plan = plan.map(
+                                &self.enabled_rules,
+                                &self.col_id_gen,
+                                [(col_id, Expr::int(1))],
+                            );
                             aggs.push((col_id, (col_id, agg_op)));
                             (plan, Expr::col_ref(col_id))
                         } else {
@@ -588,6 +593,86 @@ impl Translator {
                 self.process_aggregation_arguments(plan, expr, aggs)
             }
             _ => unimplemented!("Unsupported expression: {:?}", expr),
+        }
+    }
+
+    fn process_expr(&self, expr: &sqlparser::ast::Expr) -> Result<Expr, TranslatorError> {
+        match expr {
+            sqlparser::ast::Expr::Identifier(ident) => {
+                let id = self.env.get(&ident.value).ok_or(translation_err!(
+                    ColumnNotFound,
+                    "{}, env: {}",
+                    ident.value,
+                    self.env
+                        .columns
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| format!("{}:{}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))?;
+                Ok(Expr::col_ref(id))
+            }
+            sqlparser::ast::Expr::CompoundIdentifier(idents) => {
+                let name = idents
+                    .iter()
+                    .map(|i| i.value.clone())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                let id = self.env.get(&name).ok_or(translation_err!(
+                    ColumnNotFound,
+                    "{}, env: {}",
+                    name,
+                    self.env
+                        .columns
+                        .borrow()
+                        .iter()
+                        .map(|(k, v)| format!("{}:{}", k, v))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))?;
+                Ok(Expr::col_ref(id))
+            }
+            sqlparser::ast::Expr::BinaryOp { left, op, right } => {
+                use sqlparser::ast::BinaryOperator::*;
+                let left = self.process_expr(left)?;
+                let right = self.process_expr(right)?;
+                let bin_op = match op {
+                    And => BinaryOp::And,
+                    Or => BinaryOp::Or,
+                    Plus => BinaryOp::Add,
+                    Minus => BinaryOp::Sub,
+                    Multiply => BinaryOp::Mul,
+                    Divide => BinaryOp::Div,
+                    Eq => BinaryOp::Eq,
+                    NotEq => BinaryOp::Neq,
+                    Lt => BinaryOp::Lt,
+                    Gt => BinaryOp::Gt,
+                    LtEq => BinaryOp::Le,
+                    GtEq => BinaryOp::Ge,
+                    _ => {
+                        return Err(translation_err!(
+                            UnsupportedSQL,
+                            "Unsupported binary operator: {:?}",
+                            op
+                        ));
+                    }
+                };
+                Ok(Expr::binary(bin_op, left, right))
+            }
+            sqlparser::ast::Expr::Value(value) => match value {
+                sqlparser::ast::Value::Number(num, _) => Ok(Expr::int(num.parse().unwrap())),
+                _ => Err(translation_err!(
+                    UnsupportedSQL,
+                    "Unsupported value: {:?}",
+                    value
+                )),
+            },
+            _ => Err(translation_err!(
+                UnsupportedSQL,
+                "Unsupported expression: {:?}",
+                expr
+            )),
         }
     }
 }
@@ -629,7 +714,9 @@ mod tests {
 
     use crate::{
         catalog::{Catalog, Column, DataType, Schema, Table},
-        translator::Translator,
+        col_id_generator::ColIdGenerator,
+        rules::Rules,
+        translator2::Translator,
     };
 
     fn get_test_catalog() -> Catalog {
@@ -644,15 +731,15 @@ mod tests {
         catalog.add_table(Table::new(
             "t2",
             Schema::new(vec![
-                Column::new("a", DataType::Int),
-                Column::new("b", DataType::Int),
+                Column::new("c", DataType::Int),
+                Column::new("d", DataType::Int),
             ]),
         ));
         catalog.add_table(Table::new(
             "t3",
             Schema::new(vec![
-                Column::new("c", DataType::Int),
-                Column::new("d", DataType::Int),
+                Column::new("e", DataType::Int),
+                Column::new("f", DataType::Int),
             ]),
         ));
         catalog
@@ -679,213 +766,81 @@ mod tests {
         *query
     }
 
+    fn get_translator() -> Translator {
+        let catalog = Rc::new(get_test_catalog());
+        let enabled_rules = Rc::new(Rules::default());
+        let col_id_gen = Rc::new(ColIdGenerator::new());
+        Translator::new(&catalog, &enabled_rules, &col_id_gen)
+    }
+
+    fn get_plan(sql: &str) -> String {
+        let query = parse_sql(sql);
+        let mut translator = get_translator();
+        let query = translator.process_query(&query).unwrap();
+        query.plan.pretty_string()
+    }
+
+    #[test]
+    fn parse_from_clause() {
+        let sql = "SELECT a FROM t1 WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    #[should_panic]
+    fn parse_from_with_subquery() {
+        let sql = "SELECT a FROM (SELECT a FROM t1) WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_from_with_subquery_2() {
+        let sql = "SELECT a FROM (SELECT a, b FROM t1) AS t WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    #[should_panic]
+    fn parse_from_with_subquery_and_alias() {
+        let sql = "SELECT a FROM (SELECT a FROM t1) AS t WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_from_with_join() {
+        let sql = "SELECT a FROM t1 JOIN t2 ON t1.a = t2.c WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_from_with_multiple_joins() {
+        let sql =
+            "SELECT a FROM t1 JOIN t2 ON t1.a = t2.c JOIN t3 ON t2.d = t3.e WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    #[should_panic]
+    fn parse_from_with_subquery_joins() {
+        let sql = "SELECT a FROM (SELECT a FROM t1) AS t1 JOIN (SELECT c FROM t2) AS t2 ON t1.a = t2.c WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_from_with_subquery_joins_2() {
+        let sql = "SELECT a FROM (SELECT a, b FROM t1) AS t1 JOIN (SELECT c, d FROM t2) AS t2 ON t1.a = t2.c WHERE a = 1 AND b = 2";
+        println!("{}", get_plan(sql));
+    }
+
     #[test]
     fn parse_where_clause() {
         let sql = "SELECT a FROM t1 WHERE a = 1 AND b = 2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
+        println!("{}", get_plan(sql));
     }
 
     #[test]
-    fn parse_join_1() {
-        let sql = "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.a = t2.b";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_join_2() {
-        let sql = "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.a = t2.b AND t1.b = t2.a AND t1.a = 1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_join_3() {
-        let sql = "SELECT t1.a, t2.b FROM t1, t2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_where_1() {
-        let sql = "SELECT a FROM t1 WHERE a = 1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_where_2() {
-        let sql = "SELECT a FROM t1 WHERE a = 1 AND b = 2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_join_with_where_1() {
-        let sql = "SELECT t1.a, t2.b FROM t1 JOIN t2 ON t1.a = t2.b WHERE t1.b = 2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_join_with_where_2() {
-        let sql = "SELECT t1.a, t2.b FROM t1, t2 WHERE t1.a = t2.b AND t1.b = 2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_projection_1() {
-        let sql = "SELECT a, b FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_projection_2() {
-        let sql = "SELECT a + b FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_projection_3() {
-        let sql = "SELECT a + b, a - b FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_projection_4() {
-        let sql = "SELECT a, b, a + b, a - b FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_projection_5() {
-        let sql = "SELECT a, b, a + b, a - b, a = b, a < b, a > b, a <= b, a >= b FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_projection_6() {
-        let sql = "SELECT * FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_projection_7() {
-        let sql = "SELECT a, b FROM t2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_aggregation_1() {
-        let sql = "SELECT COUNT(a), SUM(b), AVG(a + b), MIN(a - b), MAX(a * b) FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_aggregation_2() {
-        let sql = "SELECT COUNT(*) + SUM(a + 4) + 4, AVG(b) FROM t1";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_aggregation_3() {
-        let sql =
-            "SELECT COUNT(*) + SUM(a + 4) + 4, AVG(b) FROM t1 GROUP BY a, b HAVING a > 1 AND b < 2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
-    }
-
-    #[test]
-    fn parse_aggregation_4() {
-        let sql = "SELECT COUNT(*) + SUM(a + d + 3) + 4, AVG(b) FROM t1, t3 GROUP BY a, b HAVING a > 1 AND b < 2";
-        let query = parse_sql(sql);
-
-        let catalog = Rc::new(get_test_catalog());
-        let mut translator = Translator::new(catalog);
-        let plan = translator.process_query(&query).unwrap();
-        plan.pretty_print();
+    fn parse_subquery() {
+        let sql = "SELECT a, x, y FROM t1, (SELECT COUNT(*) AS x, SUM(b) as y FROM t2 WHERE c = a)";
+        println!("{}", get_plan(sql));
     }
 }

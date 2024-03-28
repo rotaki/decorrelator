@@ -9,59 +9,10 @@ use std::{
     rc::Rc,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Rule {
-    Hoist,
-    Decorrelate,
-}
-
-pub struct OptimizerCtx {
-    next_id: Rc<RefCell<usize>>,
-    enabled_rules: Rc<RefCell<HashSet<Rule>>>,
-    id_to_col_name: Rc<RefCell<HashMap<usize, String>>>,
-}
-
-impl OptimizerCtx {
-    pub fn new(id_to_col_name: Rc<RefCell<HashMap<usize, String>>>) -> Self {
-        let start_id = 1000;
-        OptimizerCtx {
-            next_id: Rc::new(RefCell::new(start_id)),
-            enabled_rules: Rc::new(RefCell::new(HashSet::new())),
-            id_to_col_name,
-        }
-    }
-
-    pub fn next(&self) -> usize {
-        let id = *self.next_id.borrow();
-        *self.next_id.borrow_mut() += 1;
-        id
-    }
-
-    pub fn enable(&self, rule: Rule) {
-        self.enabled_rules.borrow_mut().insert(rule);
-    }
-
-    pub fn enabled(&self, rule: Rule) -> bool {
-        self.enabled_rules.borrow().contains(&rule)
-    }
-
-    pub fn register_column(&self, id: usize, name: String) {
-        self.id_to_col_name.borrow_mut().insert(id, name);
-    }
-
-    pub fn column_name(&self, id: usize) -> Option<String> {
-        self.id_to_col_name.borrow().get(&id).cloned()
-    }
-
-    pub fn get_column_id(&self, name: &str) -> Option<usize> {
-        for (id, col_name) in self.id_to_col_name.borrow().iter() {
-            if col_name == name {
-                return Some(*id);
-            }
-        }
-        None
-    }
-}
+use crate::{
+    col_id_generator::ColIdGeneratorRef,
+    rules::{Rule, RulesRef},
+};
 
 #[derive(Debug, Clone)]
 pub enum BinaryOp {
@@ -340,7 +291,12 @@ impl RelExpr {
         }
     }
 
-    pub fn select(self, opt_ctx: &OptimizerCtx, predicates: Vec<Expr>) -> RelExpr {
+    pub fn select(
+        self,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
+        predicates: Vec<Expr>,
+    ) -> RelExpr {
         if predicates.is_empty() {
             return self;
         }
@@ -354,7 +310,7 @@ impl RelExpr {
                 predicates: mut preds,
             } => {
                 preds.append(&mut predicates);
-                src.select(opt_ctx, preds)
+                src.select(enabled_rules, col_id_gen, preds)
             }
             RelExpr::Join {
                 join_type,
@@ -363,7 +319,7 @@ impl RelExpr {
                 predicates: mut preds,
             } => {
                 preds.append(&mut predicates);
-                left.join(opt_ctx, join_type, *right, preds)
+                left.join(enabled_rules, col_id_gen, join_type, *right, preds)
             }
             RelExpr::Aggregate {
                 src,
@@ -375,9 +331,9 @@ impl RelExpr {
                 let (push_down, keep): (Vec<_>, Vec<_>) = predicates
                     .into_iter()
                     .partition(|pred| pred.free().is_subset(&group_by_cols));
-                src.select(opt_ctx, push_down)
+                src.select(enabled_rules, col_id_gen, push_down)
                     .aggregate(group_by, aggrs)
-                    .select(opt_ctx, keep)
+                    .select(enabled_rules, col_id_gen, keep)
             }
             RelExpr::Map { input, exprs } => {
                 // If the predicate does not intersect with the atts of exprs, we can push it to the source
@@ -386,9 +342,9 @@ impl RelExpr {
                     .into_iter()
                     .partition(|pred| pred.free().is_disjoint(&atts));
                 input
-                    .select(opt_ctx, push_down)
-                    .map(opt_ctx, exprs)
-                    .select(opt_ctx, keep)
+                    .select(enabled_rules, col_id_gen, push_down)
+                    .map(enabled_rules, col_id_gen, exprs)
+                    .select(enabled_rules, col_id_gen, keep)
             }
             _ => RelExpr::Select {
                 src: Box::new(self),
@@ -399,7 +355,8 @@ impl RelExpr {
 
     pub fn join(
         self,
-        opt_ctx: &OptimizerCtx,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
         join_type: JoinType,
         other: RelExpr,
         mut predicates: Vec<Expr>,
@@ -421,9 +378,13 @@ impl RelExpr {
                 // This condition is necessary to avoid infinite recursion
                 let push_down = push_down.into_iter().map(|expr| expr.clone()).collect();
                 let keep = keep.into_iter().map(|expr| expr.clone()).collect();
-                return self
-                    .select(opt_ctx, push_down)
-                    .join(opt_ctx, join_type, other, keep);
+                return self.select(enabled_rules, col_id_gen, push_down).join(
+                    enabled_rules,
+                    col_id_gen,
+                    join_type,
+                    other,
+                    keep,
+                );
             }
         }
 
@@ -439,7 +400,13 @@ impl RelExpr {
                 // This condition is necessary to avoid infinite recursion
                 let push_down = push_down.into_iter().map(|expr| expr.clone()).collect();
                 let keep = keep.into_iter().map(|expr| expr.clone()).collect();
-                return self.join(opt_ctx, join_type, other.select(opt_ctx, push_down), keep);
+                return self.join(
+                    enabled_rules,
+                    col_id_gen,
+                    join_type,
+                    other.select(enabled_rules, col_id_gen, push_down),
+                    keep,
+                );
             }
         }
 
@@ -454,7 +421,13 @@ impl RelExpr {
                 .collect::<HashSet<_>>();
             let atts = self.att().union(&other.att()).cloned().collect();
             if free.is_subset(&atts) {
-                return self.join(opt_ctx, JoinType::Inner, other, predicates);
+                return self.join(
+                    enabled_rules,
+                    col_id_gen,
+                    JoinType::Inner,
+                    other,
+                    predicates,
+                );
             }
         }
 
@@ -466,14 +439,14 @@ impl RelExpr {
         }
     }
 
-    pub fn project(self, _opt_ctx: &OptimizerCtx, cols: HashSet<usize>) -> RelExpr {
+    pub fn project(self, enabled_rules: &RulesRef, cols: HashSet<usize>) -> RelExpr {
         match self {
             RelExpr::Project {
                 src,
                 cols: existing_cols,
             } => {
                 if cols.is_subset(&existing_cols) {
-                    src.project(_opt_ctx, cols)
+                    src.project(enabled_rules, cols)
                 } else {
                     panic!("Can't project columns that are not in the source")
                 }
@@ -509,7 +482,8 @@ impl RelExpr {
 
     pub fn map(
         self,
-        opt_ctx: &OptimizerCtx,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
         exprs: impl IntoIterator<Item = (usize, Expr)>,
     ) -> RelExpr {
         let mut exprs: Vec<(usize, Expr)> = exprs.into_iter().collect();
@@ -518,12 +492,17 @@ impl RelExpr {
             return self;
         }
 
-        if opt_ctx.enabled(Rule::Hoist) {
+        if enabled_rules.enabled(&Rule::Hoist) {
             for i in 0..exprs.len() {
                 // Only hoist expressions with subqueries
                 if exprs[i].1.has_subquery() {
                     let (id, expr) = exprs.swap_remove(i);
-                    return self.map(opt_ctx, exprs).hoist(opt_ctx, id, expr);
+                    return self.map(enabled_rules, col_id_gen, exprs).hoist(
+                        enabled_rules,
+                        col_id_gen,
+                        id,
+                        expr,
+                    );
                 }
             }
         }
@@ -543,7 +522,11 @@ impl RelExpr {
                     .into_iter()
                     .partition(|(_, expr)| expr.free().is_disjoint(&atts));
                 existing_exprs.append(&mut push_down);
-                input.map(opt_ctx, existing_exprs).map(opt_ctx, keep)
+                input.map(enabled_rules, col_id_gen, existing_exprs).map(
+                    enabled_rules,
+                    col_id_gen,
+                    keep,
+                )
             }
             _ => RelExpr::Map {
                 input: Box::new(self),
@@ -552,22 +535,33 @@ impl RelExpr {
         }
     }
 
-    pub fn flatmap(self, opt_ctx: &OptimizerCtx, func: RelExpr) -> RelExpr {
-        if opt_ctx.enabled(Rule::Decorrelate) {
+    pub fn flatmap(
+        self,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
+        func: RelExpr,
+    ) -> RelExpr {
+        if enabled_rules.enabled(&Rule::Decorrelate) {
             // Not correlated!
             if func.free().is_empty() {
-                return self.join(opt_ctx, JoinType::CrossJoin, func, vec![]);
+                return self.join(enabled_rules, col_id_gen, JoinType::CrossJoin, func, vec![]);
             }
 
             // Pull up Project
             if let RelExpr::Project { src, mut cols } = func {
                 cols.extend(self.att());
-                return self.flatmap(opt_ctx, *src).project(opt_ctx, cols);
+                return self
+                    .flatmap(enabled_rules, col_id_gen, *src)
+                    .project(enabled_rules, cols);
             }
 
             // Pull up Maps
             if let RelExpr::Map { input, exprs } = func {
-                return self.flatmap(opt_ctx, *input).map(opt_ctx, exprs);
+                return self.flatmap(enabled_rules, col_id_gen, *input).map(
+                    enabled_rules,
+                    col_id_gen,
+                    exprs,
+                );
             }
         }
         RelExpr::FlatMap {
@@ -620,25 +614,36 @@ impl RelExpr {
     // |  Scan @1, @2 |     4
     // ----------------
 
-    fn hoist(self, opt_ctx: &OptimizerCtx, id: usize, expr: Expr) -> RelExpr {
+    fn hoist(
+        self,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
+        id: usize,
+        expr: Expr,
+    ) -> RelExpr {
         match expr {
             Expr::Subquery { expr } => {
                 let att = expr.att();
                 assert!(att.len() == 1);
                 let input_col_id = att.iter().next().unwrap();
                 // Give the column the name that's expected
-                let rhs: RelExpr = expr.map(opt_ctx, vec![(id, Expr::col_ref(*input_col_id))]);
-                self.flatmap(opt_ctx, rhs)
+                let rhs: RelExpr = expr.map(
+                    enabled_rules,
+                    col_id_gen,
+                    vec![(id, Expr::col_ref(*input_col_id))],
+                );
+                self.flatmap(enabled_rules, col_id_gen, rhs)
             }
             Expr::Binary { op, left, right } => {
                 // Hoist the left, hoist the right, then perform the binary operation
-                let lhs_id = opt_ctx.next();
-                let rhs_id = opt_ctx.next();
+                let lhs_id = col_id_gen.next();
+                let rhs_id = col_id_gen.next();
                 let att = self.att();
-                self.hoist(opt_ctx, lhs_id, *left)
-                    .hoist(opt_ctx, rhs_id, *right)
+                self.hoist(enabled_rules, col_id_gen, lhs_id, *left)
+                    .hoist(enabled_rules, col_id_gen, rhs_id, *right)
                     .map(
-                        opt_ctx,
+                        enabled_rules,
+                        col_id_gen,
                         [(
                             id,
                             Expr::Binary {
@@ -648,9 +653,14 @@ impl RelExpr {
                             },
                         )],
                     )
-                    .project(opt_ctx, att.into_iter().chain([id].into_iter()).collect())
+                    .project(
+                        enabled_rules,
+                        att.into_iter().chain([id].into_iter()).collect(),
+                    )
             }
-            Expr::Int { .. } | Expr::ColRef { .. } => self.map(opt_ctx, vec![(id, expr)]),
+            Expr::Int { .. } | Expr::ColRef { .. } => {
+                self.map(enabled_rules, col_id_gen, vec![(id, expr)])
+            }
         }
     }
 }
@@ -856,63 +866,4 @@ impl RelExpr {
             }
         }
     }
-}
-fn main() {
-    let id_to_col_name = Rc::new(RefCell::new(HashMap::new()));
-    let opt_ctx = OptimizerCtx::new(id_to_col_name);
-    opt_ctx.enable(Rule::Hoist);
-    opt_ctx.enable(Rule::Decorrelate);
-
-    let a = opt_ctx.next();
-    let b = opt_ctx.next();
-    let x = opt_ctx.next();
-    let y = opt_ctx.next();
-
-    let sum_col = opt_ctx.next();
-
-    let v = RelExpr::scan("a".into(), vec![a, b]).map(
-        &opt_ctx,
-        vec![
-            // (
-            //     opt_ctx.next(),
-            //     Expr::int(3).plus(Expr::Subquery {
-            //         expr: Box::new(
-            //             RelExpr::scan("x".into(), vec![x, y]).project([x].into_iter().collect()),
-            //         ),
-            //     }),
-            // ),
-            (
-                opt_ctx.next(),
-                Expr::int(4).add(Expr::Subquery {
-                    expr: Box::new(
-                        RelExpr::scan("x".into(), vec![x, y])
-                            .project(&opt_ctx, [x].into_iter().collect())
-                            .map(
-                                &opt_ctx,
-                                [(sum_col, Expr::col_ref(x).add(Expr::col_ref(a)))],
-                            )
-                            .project(&opt_ctx, [sum_col].into_iter().collect()),
-                    ),
-                }),
-            ),
-        ],
-    );
-
-    // let v = RelExpr::scan("a".into(), vec![a, b]).map(
-    //     &opt_ctx,
-    //     vec![(
-    //         opt_ctx.next(),
-    //         Expr::Subquery {
-    //             expr: Box::new(
-    //                 RelExpr::scan("x".into(), vec![x, y])
-    //                     .project(&opt_ctx, [x].into_iter().collect()),
-    //             ),
-    //         },
-    //     )],
-    // );
-
-    let mut out = String::new();
-    v.print_inner(0, &mut out);
-
-    println!("{}", out);
 }

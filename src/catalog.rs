@@ -145,6 +145,27 @@ impl Catalog {
             .find(|(_, n)| *n == name)
             .map(|(id, _)| *id)
     }
+
+    pub fn get_cols(&self, table_name: &str) -> Vec<(String, usize)> {
+        // find table_index in the vector of tables
+        let table_index = self
+            .tables
+            .borrow()
+            .iter()
+            .position(|t| t.name == table_name)
+            .unwrap();
+        // return column name, table_index * 100 + column_index
+        self.tables
+            .borrow()
+            .get(table_index)
+            .unwrap()
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (c.name.clone(), table_index * 100 + i))
+            .collect()
+    }
 }
 
 pub type CatalogRef = Rc<Catalog>;
