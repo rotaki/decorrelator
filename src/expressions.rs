@@ -11,6 +11,7 @@ use std::{
 
 use crate::{
     col_id_generator::ColIdGeneratorRef,
+    field::Field,
     rules::{Rule, RulesRef},
 };
 
@@ -75,13 +76,18 @@ pub enum Expr {
     ColRef {
         id: usize,
     },
-    Int {
-        val: i64,
+    Field {
+        val: Field,
     },
     Binary {
         op: BinaryOp,
         left: Box<Expr>,
         right: Box<Expr>,
+    },
+    Case {
+        expr: Box<Expr>,
+        whens: Vec<(Expr, Expr)>,
+        else_expr: Box<Expr>,
     },
     Subquery {
         expr: Box<RelExpr>,
@@ -94,7 +100,9 @@ impl Expr {
     }
 
     pub fn int(val: i64) -> Expr {
-        Expr::Int { val }
+        Expr::Field {
+            val: Field::Int(val),
+        }
     }
 
     pub fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
@@ -130,8 +138,12 @@ impl Expr {
     pub fn has_subquery(&self) -> bool {
         match self {
             Expr::ColRef { id: _ } => false,
-            Expr::Int { val: _ } => false,
+            Expr::Field { val: _ } => false,
             Expr::Binary { left, right, .. } => left.has_subquery() || right.has_subquery(),
+            Expr::Case { .. } => {
+                // Currently, we don't support subqueries in the case expression
+                false
+            }
             Expr::Subquery { expr: _ } => true,
         }
     }
@@ -152,6 +164,40 @@ impl Expr {
         }
     }
 
+    // Rewrite the free variables in the expression tree
+    fn rewrite(self, src_to_dest: &HashMap<usize, usize>) -> Expr {
+        match self {
+            Expr::ColRef { id } => {
+                if let Some(dest) = src_to_dest.get(&id) {
+                    Expr::ColRef { id: *dest }
+                } else {
+                    Expr::ColRef { id }
+                }
+            }
+            Expr::Field { val } => Expr::Field { val },
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op,
+                left: Box::new(left.rewrite(src_to_dest)),
+                right: Box::new(right.rewrite(src_to_dest)),
+            },
+            Expr::Case {
+                expr,
+                whens,
+                else_expr,
+            } => Expr::Case {
+                expr: Box::new(expr.rewrite(src_to_dest)),
+                whens: whens
+                    .into_iter()
+                    .map(|(when, then)| (when.rewrite(src_to_dest), then.rewrite(src_to_dest)))
+                    .collect(),
+                else_expr: Box::new(else_expr.rewrite(src_to_dest)),
+            },
+            Expr::Subquery { expr } => Expr::Subquery {
+                expr: Box::new(expr.rewrite_free_variables(src_to_dest)),
+            },
+        }
+    }
+
     pub fn pretty_print(&self) {
         println!("{}", self.pretty_string());
     }
@@ -167,13 +213,30 @@ impl Expr {
             Expr::ColRef { id } => {
                 out.push_str(&format!("@{}", id));
             }
-            Expr::Int { val } => {
+            Expr::Field { val } => {
                 out.push_str(&format!("{}", val));
             }
             Expr::Binary { op, left, right } => {
                 left.print_inner(indent, out);
                 out.push_str(&format!("{}", op));
                 right.print_inner(indent, out);
+            }
+            Expr::Case {
+                expr,
+                whens,
+                else_expr,
+            } => {
+                out.push_str("case ");
+                expr.print_inner(indent, out);
+                for (when, then) in whens {
+                    out.push_str(" when ");
+                    when.print_inner(indent, out);
+                    out.push_str(" then ");
+                    then.print_inner(indent, out);
+                }
+                out.push_str(" else ");
+                else_expr.print_inner(indent, out);
+                out.push_str(" end");
             }
             Expr::Subquery { expr } => {
                 out.push_str("λ.(\n");
@@ -204,10 +267,23 @@ impl Expr {
                 set.insert(*id);
                 set
             }
-            Expr::Int { val: _ } => HashSet::new(),
+            Expr::Field { val: _ } => HashSet::new(),
             Expr::Binary { op, left, right } => {
                 let mut set = left.free();
                 set.extend(right.free());
+                set
+            }
+            Expr::Case {
+                expr,
+                whens,
+                else_expr,
+            } => {
+                let mut set = expr.free();
+                for (when, then) in whens {
+                    set.extend(when.free());
+                    set.extend(then.free());
+                }
+                set.extend(else_expr.free());
                 set
             }
             Expr::Subquery { expr } => expr.free(),
@@ -281,6 +357,10 @@ pub enum RelExpr {
         input: Box<RelExpr>,
         func: Box<RelExpr>,
     },
+    Rename {
+        src: Box<RelExpr>,
+        src_to_dest: HashMap<usize, usize>, // (src_column_id, dest_column_id)
+    },
 }
 
 impl RelExpr {
@@ -304,52 +384,60 @@ impl RelExpr {
             .into_iter()
             .flat_map(|expr| expr.split_conjunction())
             .collect();
-        match self {
+
+        if enabled_rules.enabled(&Rule::SelectionPushdown) {
+            match self {
+                RelExpr::Select {
+                    src,
+                    predicates: mut preds,
+                } => {
+                    preds.append(&mut predicates);
+                    src.select(enabled_rules, col_id_gen, preds)
+                }
+                RelExpr::Join {
+                    join_type,
+                    left,
+                    right,
+                    predicates: mut preds,
+                } => {
+                    preds.append(&mut predicates);
+                    left.join(enabled_rules, col_id_gen, join_type, *right, preds)
+                }
+                RelExpr::Aggregate {
+                    src,
+                    group_by,
+                    aggrs,
+                } => {
+                    // If the predicate is bound by the group by columns, we can push it to the source
+                    let group_by_cols: HashSet<_> = group_by.iter().cloned().collect();
+                    let (push_down, keep): (Vec<_>, Vec<_>) = predicates
+                        .into_iter()
+                        .partition(|pred| pred.free().is_subset(&group_by_cols));
+                    src.select(enabled_rules, col_id_gen, push_down)
+                        .aggregate(group_by, aggrs)
+                        .select(enabled_rules, col_id_gen, keep)
+                }
+                RelExpr::Map { input, exprs } => {
+                    // If the predicate does not intersect with the atts of exprs, we can push it to the source
+                    let atts = exprs.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
+                    let (push_down, keep): (Vec<_>, Vec<_>) = predicates
+                        .into_iter()
+                        .partition(|pred| pred.free().is_disjoint(&atts));
+                    input
+                        .select(enabled_rules, col_id_gen, push_down)
+                        .map(enabled_rules, col_id_gen, exprs)
+                        .select(enabled_rules, col_id_gen, keep)
+                }
+                _ => RelExpr::Select {
+                    src: Box::new(self),
+                    predicates,
+                },
+            }
+        } else {
             RelExpr::Select {
-                src,
-                predicates: mut preds,
-            } => {
-                preds.append(&mut predicates);
-                src.select(enabled_rules, col_id_gen, preds)
-            }
-            RelExpr::Join {
-                join_type,
-                left,
-                right,
-                predicates: mut preds,
-            } => {
-                preds.append(&mut predicates);
-                left.join(enabled_rules, col_id_gen, join_type, *right, preds)
-            }
-            RelExpr::Aggregate {
-                src,
-                group_by,
-                aggrs,
-            } => {
-                // If the predicate is bound by the group by columns, we can push it to the source
-                let group_by_cols: HashSet<_> = group_by.iter().cloned().collect();
-                let (push_down, keep): (Vec<_>, Vec<_>) = predicates
-                    .into_iter()
-                    .partition(|pred| pred.free().is_subset(&group_by_cols));
-                src.select(enabled_rules, col_id_gen, push_down)
-                    .aggregate(group_by, aggrs)
-                    .select(enabled_rules, col_id_gen, keep)
-            }
-            RelExpr::Map { input, exprs } => {
-                // If the predicate does not intersect with the atts of exprs, we can push it to the source
-                let atts = exprs.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
-                let (push_down, keep): (Vec<_>, Vec<_>) = predicates
-                    .into_iter()
-                    .partition(|pred| pred.free().is_disjoint(&atts));
-                input
-                    .select(enabled_rules, col_id_gen, push_down)
-                    .map(enabled_rules, col_id_gen, exprs)
-                    .select(enabled_rules, col_id_gen, keep)
-            }
-            _ => RelExpr::Select {
                 src: Box::new(self),
                 predicates,
-            },
+            }
         }
     }
 
@@ -439,36 +527,123 @@ impl RelExpr {
         }
     }
 
-    pub fn project(self, enabled_rules: &RulesRef, cols: HashSet<usize>) -> RelExpr {
-        match self {
-            RelExpr::Project {
-                src,
-                cols: existing_cols,
-            } => {
-                if cols.is_subset(&existing_cols) {
-                    src.project(enabled_rules, cols)
-                } else {
-                    panic!("Can't project columns that are not in the source")
-                }
-            }
-            RelExpr::Map {
-                input,
-                exprs: mut existing_exprs,
-            } => {
-                // Remove the mappings that are not used in the projection.
-                existing_exprs.retain(|(id, _)| cols.contains(id));
+    pub fn project(
+        self,
+        enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
+        cols: HashSet<usize>,
+    ) -> RelExpr {
+        if self.att() == cols {
+            return self;
+        }
+
+        if self.att().is_subset(&cols) {
+            panic!("Can't project columns that are not in the source")
+        }
+
+        if enabled_rules.enabled(&Rule::ProjectionPushdown) {
+            match self {
                 RelExpr::Project {
-                    src: Box::new(RelExpr::Map {
-                        input,
-                        exprs: existing_exprs,
-                    }),
-                    cols,
+                    src,
+                    cols: existing_cols,
+                } => {
+                    if cols.is_subset(&existing_cols) {
+                        src.project(enabled_rules, col_id_gen, cols)
+                    } else {
+                        panic!("Can't project columns that are not in the source")
+                    }
                 }
+                RelExpr::Map {
+                    input,
+                    exprs: mut existing_exprs,
+                } => {
+                    // Remove the mappings that are not used in the projection.
+                    existing_exprs.retain(|(id, _)| cols.contains(id));
+                    RelExpr::Project {
+                        src: Box::new(RelExpr::Map {
+                            input,
+                            exprs: existing_exprs,
+                        }),
+                        cols,
+                    }
+                }
+                RelExpr::Select { src, predicates } => {
+                    // The necessary columns are the free variables of the predicates and the projection columns
+                    let free: HashSet<usize> =
+                        predicates.iter().flat_map(|pred| pred.free()).collect();
+                    let new_cols = cols.union(&free).cloned().collect();
+                    RelExpr::Project {
+                        src: Box::new(RelExpr::Select {
+                            src: Box::new(src.project(enabled_rules, col_id_gen, new_cols)),
+                            predicates,
+                        }),
+                        cols,
+                    }
+                }
+                RelExpr::Join {
+                    join_type,
+                    left,
+                    right,
+                    predicates,
+                } => {
+                    // The necessary columns are the free variables of the predicates and the projection columns
+                    let free: HashSet<usize> =
+                        predicates.iter().flat_map(|pred| pred.free()).collect();
+                    let new_cols = cols.union(&free).cloned().collect();
+                    let left_proj = left.att().intersection(&new_cols).cloned().collect();
+                    let right_proj = right.att().intersection(&new_cols).cloned().collect();
+                    RelExpr::Project {
+                        src: Box::new(RelExpr::Join {
+                            join_type,
+                            left: Box::new(left.project(enabled_rules, col_id_gen, left_proj)),
+                            right: Box::new(right.project(enabled_rules, col_id_gen, right_proj)),
+                            predicates,
+                        }),
+                        cols,
+                    }
+                }
+                RelExpr::Rename {
+                    src,
+                    src_to_dest: mut existing_rename,
+                } => {
+                    // Remove the mappings that are not used in the projection.
+                    existing_rename.retain(|_, dest| cols.contains(dest));
+                    // Pushdown the projection to the source. First we need to rewrite the column names
+                    let existing_rename_rev: HashMap<usize, usize> = existing_rename
+                        .iter()
+                        .map(|(src, dest)| (*dest, *src))
+                        .collect();
+                    let mut new_cols = HashSet::new();
+                    for col in cols {
+                        if let Some(src) = existing_rename_rev.get(&col) {
+                            new_cols.insert(*src);
+                        } else {
+                            new_cols.insert(col);
+                        }
+                    }
+                    src.project(enabled_rules, &col_id_gen, new_cols)
+                        .rename_to(existing_rename)
+                }
+                RelExpr::Scan {
+                    table_name,
+                    mut column_names,
+                } => {
+                    column_names.retain(|col| cols.contains(col));
+                    RelExpr::Scan {
+                        table_name,
+                        column_names,
+                    }
+                }
+                _ => RelExpr::Project {
+                    src: Box::new(self),
+                    cols,
+                },
             }
-            _ => RelExpr::Project {
+        } else {
+            RelExpr::Project {
                 src: Box::new(self),
                 cols,
-            },
+            }
         }
     }
 
@@ -550,9 +725,11 @@ impl RelExpr {
             // Pull up Project
             if let RelExpr::Project { src, mut cols } = func {
                 cols.extend(self.att());
-                return self
-                    .flatmap(enabled_rules, col_id_gen, *src)
-                    .project(enabled_rules, cols);
+                return self.flatmap(enabled_rules, col_id_gen, *src).project(
+                    enabled_rules,
+                    col_id_gen,
+                    cols,
+                );
             }
 
             // Pull up Maps
@@ -562,6 +739,88 @@ impl RelExpr {
                     col_id_gen,
                     exprs,
                 );
+            }
+
+            // Pull up Selects
+            if let RelExpr::Select { src, predicates } = func {
+                return self.flatmap(enabled_rules, col_id_gen, *src).select(
+                    enabled_rules,
+                    col_id_gen,
+                    predicates,
+                );
+            }
+
+            // Pull up Aggregates
+            if let RelExpr::Aggregate {
+                src,
+                group_by,
+                aggrs,
+            } = func
+            {
+                // Return result should be self.att() + func.att()
+                // func.att() is group_by + aggrs
+                let counts: Vec<usize> = aggrs
+                    .iter()
+                    .filter_map(|(id, (src_id, op))| {
+                        if let AggOp::Count = op {
+                            Some(*id)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                if counts.is_empty() {
+                    let att = self.att();
+                    let group_by: HashSet<usize> = group_by
+                        .iter()
+                        .cloned()
+                        .chain(att.iter().cloned())
+                        .collect();
+                    return self
+                        .flatmap(enabled_rules, col_id_gen, *src)
+                        .aggregate(group_by.into_iter().collect(), aggrs);
+                } else {
+                    // Deal with the COUNT BUG
+                    let orig = self.clone();
+                    let (mut plan, new_col_ids) = self.rename(&enabled_rules, &col_id_gen);
+                    let new_att = plan.att();
+                    let src = src.rewrite_free_variables(&new_col_ids);
+                    plan = plan.flatmap(enabled_rules, col_id_gen, src);
+                    plan = plan.aggregate(
+                        group_by
+                            .into_iter()
+                            .chain(new_att.iter().cloned())
+                            .collect(),
+                        aggrs,
+                    );
+                    plan = orig.join(
+                        enabled_rules,
+                        col_id_gen,
+                        JoinType::LeftOuter,
+                        plan,
+                        new_col_ids
+                            .iter()
+                            .map(|(src, dest)| Expr::col_ref(*src).eq(Expr::col_ref(*dest)))
+                            .collect(),
+                    );
+                    let att = plan.att();
+                    let project_att = att.difference(&new_att).cloned().collect();
+                    return plan.project(enabled_rules, col_id_gen, project_att).map(
+                        enabled_rules,
+                        col_id_gen,
+                        counts.into_iter().map(|id| {
+                            (
+                                id,
+                                Expr::Case {
+                                    expr: Box::new(Expr::col_ref(id)),
+                                    whens: [(Expr::Field { val: Field::Null }, Expr::int(0))]
+                                        .to_vec(),
+                                    else_expr: Box::new(Expr::col_ref(id)),
+                                },
+                            )
+                        }),
+                    );
+                }
             }
         }
         RelExpr::FlatMap {
@@ -655,11 +914,48 @@ impl RelExpr {
                     )
                     .project(
                         enabled_rules,
+                        col_id_gen,
                         att.into_iter().chain([id].into_iter()).collect(),
                     )
             }
-            Expr::Int { .. } | Expr::ColRef { .. } => {
+            Expr::Field { .. } | Expr::ColRef { .. } => {
                 self.map(enabled_rules, col_id_gen, vec![(id, expr)])
+            }
+            Expr::Case { .. } => {
+                panic!("Case expression is not supported in hoist")
+            }
+        }
+    }
+
+    // Rename the output columns of the relational expression
+    // Output: RelExpr, HashMap<old_col_id, new_col_id>
+    pub fn rename(
+        self,
+        _enabled_rules: &RulesRef,
+        col_id_gen: &ColIdGeneratorRef,
+    ) -> (RelExpr, HashMap<usize, usize>) {
+        let atts = self.att();
+        let cols: HashMap<usize, usize> = atts
+            .into_iter()
+            .map(|old_col_id| (old_col_id, col_id_gen.next()))
+            .collect();
+        (self.rename_to(cols.clone()), cols)
+    }
+
+    fn rename_to(self, src_to_dest: HashMap<usize, usize>) -> RelExpr {
+        if let RelExpr::Rename {
+            src,
+            src_to_dest: mut existing_rename,
+        } = self
+        {
+            for value in existing_rename.values_mut() {
+                *value = *src_to_dest.get(value).unwrap_or(value);
+            }
+            src.rename_to(existing_rename)
+        } else {
+            RelExpr::Rename {
+                src: Box::new(self.clone()),
+                src_to_dest,
             }
         }
     }
@@ -722,6 +1018,10 @@ impl RelExpr {
                 set.extend(func.free());
                 set.difference(&input.att()).cloned().collect()
             }
+            RelExpr::Rename {
+                src,
+                src_to_dest: colsk,
+            } => src.free(),
         }
     }
 
@@ -763,6 +1063,109 @@ impl RelExpr {
                 set.extend(func.att());
                 set
             }
+            RelExpr::Rename {
+                src,
+                src_to_dest: colsk,
+                ..
+            } => {
+                let mut set = src.att();
+                // rewrite the column names
+                for (src, dest) in colsk {
+                    set.remove(src);
+                    set.insert(*dest);
+                }
+                set
+            }
+        }
+    }
+
+    // Rename the free variable to the given mapping
+    fn rewrite_free_variables(self, src_to_dest: &HashMap<usize, usize>) -> RelExpr {
+        // If there is no intersection between the free variables and the mapping, we can terminate early
+        if self
+            .free()
+            .is_disjoint(&src_to_dest.keys().cloned().collect())
+        {
+            return self;
+        }
+
+        match self {
+            RelExpr::Scan { .. } => self,
+            RelExpr::Select { src, predicates } => RelExpr::Select {
+                src: Box::new(src.rewrite_free_variables(src_to_dest)),
+                predicates: predicates
+                    .into_iter()
+                    .map(|pred| pred.rewrite(src_to_dest))
+                    .collect(),
+            },
+            RelExpr::Join {
+                join_type,
+                left,
+                right,
+                predicates,
+            } => RelExpr::Join {
+                join_type,
+                left: Box::new(left.rewrite_free_variables(src_to_dest)),
+                right: Box::new(right.rewrite_free_variables(src_to_dest)),
+                predicates: predicates
+                    .into_iter()
+                    .map(|pred| pred.rewrite(src_to_dest))
+                    .collect(),
+            },
+            RelExpr::Project { src, cols } => RelExpr::Project {
+                src: Box::new(src.rewrite_free_variables(src_to_dest)),
+                cols: cols
+                    .into_iter()
+                    .map(|col| *src_to_dest.get(&col).unwrap_or(&col))
+                    .collect(),
+            },
+            RelExpr::OrderBy { src, cols } => RelExpr::OrderBy {
+                src: Box::new(src.rewrite_free_variables(src_to_dest)),
+                cols: cols
+                    .into_iter()
+                    .map(|(id, asc, nulls_first)| {
+                        (*src_to_dest.get(&id).unwrap_or(&id), asc, nulls_first)
+                    })
+                    .collect(),
+            },
+            RelExpr::Aggregate {
+                src,
+                group_by,
+                aggrs,
+            } => RelExpr::Aggregate {
+                src: Box::new(src.rewrite_free_variables(src_to_dest)),
+                group_by: group_by
+                    .into_iter()
+                    .map(|id| *src_to_dest.get(&id).unwrap_or(&id))
+                    .collect(),
+                aggrs: aggrs
+                    .into_iter()
+                    .map(|(id, (src_id, op))| {
+                        (id, (*src_to_dest.get(&src_id).unwrap_or(&src_id), op))
+                    })
+                    .collect(),
+            },
+            RelExpr::Map { input, exprs } => RelExpr::Map {
+                input: Box::new(input.rewrite_free_variables(src_to_dest)),
+                exprs: exprs
+                    .into_iter()
+                    .map(|(id, expr)| (id, expr.rewrite(src_to_dest)))
+                    .collect(),
+            },
+            RelExpr::FlatMap { input, func } => RelExpr::FlatMap {
+                input: Box::new(input.rewrite_free_variables(src_to_dest)),
+                func: Box::new(func.rewrite_free_variables(src_to_dest)),
+            },
+            RelExpr::Rename {
+                src,
+                src_to_dest: colsk,
+            } => RelExpr::Rename {
+                src: Box::new(src.rewrite_free_variables(src_to_dest)),
+                src_to_dest: colsk
+                    .into_iter()
+                    .map(|(src, dest)| (*src_to_dest.get(&src).unwrap_or(&src), dest))
+                    .collect(),
+            },
         }
     }
 }
@@ -783,12 +1186,17 @@ impl RelExpr {
             RelExpr::Scan {
                 table_name,
                 column_names,
-            } => out.push_str(&format!(
-                "{}-> scan({:?}, {:?})\n",
-                " ".repeat(indent),
-                table_name,
-                column_names
-            )),
+            } => {
+                out.push_str(&format!("{}-> scan({:?}, ", " ".repeat(indent), table_name,));
+                let mut split = "";
+                out.push_str("[");
+                for col in column_names {
+                    out.push_str(split);
+                    out.push_str(&format!("@{}", col));
+                    split = ", ";
+                }
+                out.push_str("])\n");
+            }
             RelExpr::Select { src, predicates } => {
                 out.push_str(&format!("{}-> select(", " ".repeat(indent)));
                 let mut split = "";
@@ -818,7 +1226,14 @@ impl RelExpr {
                 right.print_inner(indent + 2, out);
             }
             RelExpr::Project { src, cols } => {
-                out.push_str(&format!("{}-> project({:?})\n", " ".repeat(indent), cols));
+                out.push_str(&format!("{}-> project(", " ".repeat(indent)));
+                let mut split = "";
+                for col in cols {
+                    out.push_str(split);
+                    out.push_str(&format!("@{}", col));
+                    split = ", ";
+                }
+                out.push_str(")\n");
                 src.print_inner(indent + 2, out);
             }
             RelExpr::OrderBy { src, cols } => {
@@ -831,11 +1246,14 @@ impl RelExpr {
                 aggrs,
             } => {
                 out.push_str(&format!("{}-> aggregate(\n", " ".repeat(indent)));
-                out.push_str(&format!(
-                    "{}    group_by: {:?},\n",
-                    " ".repeat(indent),
-                    group_by
-                ));
+                out.push_str(&format!("{}    group_by: [", " ".repeat(indent),));
+                let mut split = "";
+                for col in group_by {
+                    out.push_str(split);
+                    out.push_str(&format!("@{}", col));
+                    split = ", ";
+                }
+                out.push_str("],\n");
                 for (id, (input_id, op)) in aggrs {
                     out.push_str(&format!(
                         "{}    @{} <- {}(@{})\n",
@@ -864,6 +1282,53 @@ impl RelExpr {
                 out.push_str(&format!("{}  λ.{:?}\n", " ".repeat(indent), func.free()));
                 func.print_inner(indent + 2, out);
             }
+            RelExpr::Rename {
+                src,
+                src_to_dest: colsk,
+            } => {
+                // Rename will be printed as @dest <- @src
+                out.push_str(&format!("{}-> rename(", " ".repeat(indent)));
+                let mut split = "";
+                for (src, dest) in colsk {
+                    out.push_str(split);
+                    out.push_str(&format!("@{} <- @{}", dest, src));
+                    split = ", ";
+                }
+                out.push_str(")\n");
+                src.print_inner(indent + 2, out);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{col_id_generator::ColIdGenerator, rules::Rules};
+
+    #[test]
+    fn test_new_col_id() {
+        use super::*;
+        let col_id_gen = Rc::new(ColIdGenerator::new());
+        let enabled_rules = Rc::new(Rules::new());
+        let expr = RelExpr::Scan {
+            table_name: "t".to_string(),
+            column_names: vec![1, 2],
+        };
+        let (expr, new_ids) = expr.rename(&enabled_rules, &col_id_gen);
+        expr.pretty_print();
+    }
+
+    #[test]
+    fn test_new_col_ids() {
+        use super::*;
+        let col_id_gen = Rc::new(ColIdGenerator::new());
+        let enabled_rules = Rc::new(Rules::new());
+        let expr = RelExpr::Scan {
+            table_name: "t".to_string(),
+            column_names: vec![1, 2],
+        };
+        let (expr, new_ids) = expr.rename(&enabled_rules, &col_id_gen);
+        let (expr, new_ids) = expr.rename(&enabled_rules, &col_id_gen);
+        expr.pretty_print();
     }
 }

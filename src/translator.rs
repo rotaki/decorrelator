@@ -266,27 +266,35 @@ impl Translator {
                 let table_name = get_name(name);
                 if self.catalog_ref.is_valid_table(&table_name) {
                     let cols = self.catalog_ref.get_cols(&table_name);
+                    let plan =
+                        RelExpr::scan(table_name.clone(), cols.iter().map(|(_, id)| *id).collect());
+                    let att = plan.att();
+                    let (plan, mut new_col_ids) =
+                        plan.rename(&self.enabled_rules, &self.col_id_gen);
 
-                    for (col_name, col_id) in &cols {
-                        self.env.set(col_name, *col_id);
+                    for i in att {
+                        let new_col_id = new_col_ids.remove(&i).unwrap();
+                        // get the name of the column
+                        let col_name = cols.iter().find(|(_, id)| *id == i).cloned().unwrap().0;
+                        self.env.set(&col_name, new_col_id);
                         self.env
-                            .set(&format!("{}.{}", table_name, col_name), *col_id);
-                    }
+                            .set(&format!("{}.{}", table_name, col_name), new_col_id);
 
-                    if let Some(alias) = alias {
-                        if is_valid_alias(&alias.name.value) {
-                            for (col_name, col_id) in &cols {
-                                self.env.set(&format!("{}.{}", alias, col_name), *col_id);
+                        // If there is an alias, set the alias in the current environment
+                        if let Some(alias) = alias {
+                            if is_valid_alias(&alias.name.value) {
+                                self.env.set(&format!("{}.{}", alias, col_name), new_col_id);
+                            } else {
+                                return Err(translation_err!(
+                                    InvalidSQL,
+                                    "Invalid alias name: {}",
+                                    alias.name.value
+                                ));
                             }
                         }
                     }
-                    Ok((
-                        RelExpr::Scan {
-                            table_name,
-                            column_names: cols.into_iter().map(|(_, col_id)| col_id).collect(),
-                        },
-                        false,
-                    ))
+
+                    Ok((plan, false))
                 } else {
                     Err(translation_err!(TableNotFound, "{}", table_name))
                 }
@@ -301,7 +309,9 @@ impl Translator {
                     &self.env,
                 );
                 let subquery = translator.process_query(subquery)?;
-                let att = subquery.plan.att();
+                let plan = subquery.plan;
+                let att = plan.att();
+
                 for i in att {
                     // get the name of the column from env
                     let names = subquery.env.get_names(i);
@@ -310,12 +320,20 @@ impl Translator {
                     }
                     // If there is an alias, set the alias in the current environment
                     if let Some(alias) = alias {
-                        for name in &names {
-                            self.env.set(&format!("{}.{}", alias, name), i);
+                        if is_valid_alias(&alias.name.value) {
+                            for name in &names {
+                                self.env.set(&format!("{}.{}", alias, name), i);
+                            }
+                        } else {
+                            return Err(translation_err!(
+                                InvalidSQL,
+                                "Invalid alias name: {}",
+                                alias.name.value
+                            ));
                         }
                     }
                 }
-                Ok((subquery.plan, true))
+                Ok((plan, true))
             }
             _ => Err(translation_err!(UnsupportedSQL, "Unsupported table factor")),
         }
@@ -491,7 +509,7 @@ impl Translator {
             plan = self.process_where(plan, having)?;
         }
         plan = plan.map(&self.enabled_rules, &self.col_id_gen, maps); // This map corresponds to the Level3 in the comment above
-        plan = plan.project(&self.enabled_rules, projected_cols);
+        plan = plan.project(&self.enabled_rules, &self.col_id_gen, projected_cols);
         Ok(plan)
     }
 
@@ -581,8 +599,8 @@ impl Translator {
                                 &self.col_id_gen,
                                 [(col_id, Expr::int(1))],
                             );
-                            aggs.push((col_id, (col_id, agg_op)));
-                            (plan, Expr::col_ref(col_id))
+                            aggs.push((agg_col_id, (col_id, agg_op)));
+                            (plan, Expr::col_ref(agg_col_id))
                         } else {
                             panic!("Wildcard is only supported for COUNT");
                         }
@@ -716,7 +734,7 @@ mod tests {
         catalog::{Catalog, Column, DataType, Schema, Table},
         col_id_generator::ColIdGenerator,
         rules::Rules,
-        translator2::Translator,
+        translator::Translator,
     };
 
     fn get_test_catalog() -> Catalog {
@@ -726,6 +744,9 @@ mod tests {
             Schema::new(vec![
                 Column::new("a", DataType::Int),
                 Column::new("b", DataType::Int),
+                Column::new("p", DataType::Int),
+                Column::new("q", DataType::Int),
+                Column::new("r", DataType::Int),
             ]),
         ));
         catalog.add_table(Table::new(
@@ -841,6 +862,31 @@ mod tests {
     #[test]
     fn parse_subquery() {
         let sql = "SELECT a, x, y FROM t1, (SELECT COUNT(*) AS x, SUM(b) as y FROM t2 WHERE c = a)";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_subquery_with_alias() {
+        let sql =
+            "SELECT a, x, y FROM t1, (SELECT COUNT(a) AS x, SUM(b) as y FROM t2 WHERE c = a) AS t2";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_subquery_with_same_tables() {
+        let sql = "SELECT x, y FROM (SELECT a as x FROM t1), (SELECT a as y FROM t1) WHERE x = y";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_joins_with_same_name() {
+        let sql = "SELECT * FROM t1 as a, t1 as b";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parser_aggregate() {
+        let sql = "SELECT COUNT(a), SUM(b) FROM t1";
         println!("{}", get_plan(sql));
     }
 }

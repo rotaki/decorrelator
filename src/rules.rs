@@ -4,6 +4,8 @@ use std::{cell::RefCell, collections::HashSet, rc::Rc};
 pub enum Rule {
     Hoist,
     Decorrelate,
+    SelectionPushdown,
+    ProjectionPushdown,
 }
 
 pub struct Rules {
@@ -31,6 +33,8 @@ impl Default for Rules {
         let mut rules = HashSet::new();
         rules.insert(Rule::Hoist);
         rules.insert(Rule::Decorrelate);
+        rules.insert(Rule::SelectionPushdown);
+        rules.insert(Rule::ProjectionPushdown);
         Rules {
             rules: RefCell::new(rules),
         }
