@@ -392,7 +392,7 @@ impl Translator {
                 }
                 sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
                     if !has_agg(expr) {
-                        let expr = self.process_expr(expr, Some(0))?;
+                        let expr = self.process_expr(expr, None)?;
                         let col_id = if let Expr::ColRef { id } = expr {
                             id
                         } else {
@@ -434,7 +434,7 @@ impl Translator {
                 sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
                     // create a new col_id for the expression
                     let col_id = if !has_agg(expr) {
-                        let expr = self.process_expr(expr, Some(0))?;
+                        let expr = self.process_expr(expr, None)?;
                         let col_id = if let Expr::ColRef { id } = expr {
                             id
                         } else {
@@ -506,7 +506,7 @@ impl Translator {
                 sqlparser::ast::GroupByExpr::Expressions(exprs) => {
                     let mut group_by = Vec::new();
                     for expr in exprs {
-                        let expr = self.process_expr(expr, Some(0))?;
+                        let expr = self.process_expr(expr, None)?;
                         let col_id = if let Expr::ColRef { id } = expr {
                             id
                         } else {
@@ -549,7 +549,7 @@ impl Translator {
                 )
             }
             sqlparser::ast::Expr::Value(_) | sqlparser::ast::Expr::TypedString { .. } => {
-                let expr = self.process_expr(expr, Some(0)).unwrap();
+                let expr = self.process_expr(expr, None).unwrap();
                 (plan, expr)
             }
             sqlparser::ast::Expr::BinaryOp { left, op, right } => {
@@ -594,9 +594,14 @@ impl Translator {
                 match function_arg_expr {
                     sqlparser::ast::FunctionArgExpr::Expr(expr) => {
                         let expr = self.process_expr(&expr, None).unwrap();
-                        let col_id = self.col_id_gen.next();
-                        plan = plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
-                        aggs.push((agg_col_id, (col_id, agg_op)));
+                        if let Expr::ColRef { id } = expr {
+                            aggs.push((agg_col_id, (id, agg_op)));
+                        } else {
+                            let col_id = self.col_id_gen.next();
+                            plan =
+                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
+                            aggs.push((agg_col_id, (col_id, agg_op)));
+                        }
                         (plan, Expr::col_ref(agg_col_id))
                     }
                     sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => {
@@ -818,6 +823,7 @@ mod tests {
         let catalog = Rc::new(get_test_catalog());
         let enabled_rules = Rc::new(Rules::default());
         // enabled_rules.disable(Rule::Decorrelate);
+        // enabled_rules.disable(Rule::ProjectionPushdown);
         let col_id_gen = Rc::new(ColIdGenerator::new());
         Translator::new(&catalog, &enabled_rules, &col_id_gen)
     }
@@ -896,6 +902,12 @@ mod tests {
     #[test]
     fn parse_subquery_2() {
         let sql = "SELECT a, x, y FROM t1, (SELECT AVG(b) AS x, SUM(d) as y FROM t2 WHERE c = a)";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_subquery_3() {
+        let sql = "SELECT a, k, x, y FROM t1, (SELECT b as k, c as x, d as y FROM t2 WHERE c = a)";
         println!("{}", get_plan(sql));
     }
 

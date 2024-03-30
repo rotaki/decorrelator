@@ -537,20 +537,17 @@ impl RelExpr {
             return self;
         }
 
-        if self.att().is_subset(&cols) {
-            panic!("Can't project columns that are not in the source")
-        }
-
         if enabled_rules.is_enabled(&Rule::ProjectionPushdown) {
             match self {
                 RelExpr::Project {
                     src,
-                    cols: existing_cols,
+                    cols: mut existing_cols,
                 } => {
-                    if cols.is_subset(&existing_cols) {
-                        src.project(enabled_rules, col_id_gen, cols)
-                    } else {
-                        panic!("Can't project columns that are not in the source")
+                    // Merge the columns that are projected
+                    existing_cols.extend(cols);
+                    RelExpr::Project {
+                        src,
+                        cols: existing_cols,
                     }
                 }
                 RelExpr::Map {
@@ -999,13 +996,34 @@ impl RelExpr {
                     .collect()
             }
             RelExpr::Project { src, cols } => {
-                // We assume that the cols are in the src attribute set.
-                // Otherwise we can't project the columns.
-                // Therefore, we don't need to check the free set of the cols.
-                src.free()
+                let mut set = src.free();
+                for col in cols {
+                    set.insert(*col);
+                }
+                set.difference(&src.att()).cloned().collect()
             }
-            RelExpr::OrderBy { src, .. } => src.free(),
-            RelExpr::Aggregate { src, .. } => src.free(),
+            RelExpr::OrderBy { src, cols } => {
+                let mut set = src.free();
+                for (id, _, _) in cols {
+                    set.insert(*id);
+                }
+                set.difference(&src.att()).cloned().collect()
+            }
+            RelExpr::Aggregate {
+                src,
+                group_by,
+                aggrs,
+                ..
+            } => {
+                let mut set = src.free();
+                for id in group_by {
+                    set.insert(*id);
+                }
+                for (_, (src_id, _)) in aggrs {
+                    set.insert(*src_id);
+                }
+                set.difference(&src.att()).cloned().collect()
+            }
             RelExpr::Map { input, exprs } => {
                 let mut set = input.free();
                 for (_, expr) in exprs {
@@ -1018,10 +1036,7 @@ impl RelExpr {
                 set.extend(func.free());
                 set.difference(&input.att()).cloned().collect()
             }
-            RelExpr::Rename {
-                src,
-                src_to_dest: colsk,
-            } => src.free(),
+            RelExpr::Rename { src, .. } => src.free(),
         }
     }
 
@@ -1064,13 +1079,11 @@ impl RelExpr {
                 set
             }
             RelExpr::Rename {
-                src,
-                src_to_dest: colsk,
-                ..
+                src, src_to_dest, ..
             } => {
                 let mut set = src.att();
                 // rewrite the column names
-                for (src, dest) in colsk {
+                for (src, dest) in src_to_dest {
                     set.remove(src);
                     set.insert(*dest);
                 }
@@ -1158,10 +1171,10 @@ impl RelExpr {
             },
             RelExpr::Rename {
                 src,
-                src_to_dest: colsk,
+                src_to_dest: column_mappings,
             } => RelExpr::Rename {
                 src: Box::new(src.rewrite_free_variables(src_to_dest)),
-                src_to_dest: colsk
+                src_to_dest: column_mappings
                     .into_iter()
                     .map(|(src, dest)| (*src_to_dest.get(&src).unwrap_or(&src), dest))
                     .collect(),
