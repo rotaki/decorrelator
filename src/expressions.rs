@@ -385,7 +385,7 @@ impl RelExpr {
             .flat_map(|expr| expr.split_conjunction())
             .collect();
 
-        if enabled_rules.enabled(&Rule::SelectionPushdown) {
+        if enabled_rules.is_enabled(&Rule::SelectionPushdown) {
             match self {
                 RelExpr::Select {
                     src,
@@ -541,7 +541,7 @@ impl RelExpr {
             panic!("Can't project columns that are not in the source")
         }
 
-        if enabled_rules.enabled(&Rule::ProjectionPushdown) {
+        if enabled_rules.is_enabled(&Rule::ProjectionPushdown) {
             match self {
                 RelExpr::Project {
                     src,
@@ -667,7 +667,7 @@ impl RelExpr {
             return self;
         }
 
-        if enabled_rules.enabled(&Rule::Hoist) {
+        if enabled_rules.is_enabled(&Rule::Hoist) {
             for i in 0..exprs.len() {
                 // Only hoist expressions with subqueries
                 if exprs[i].1.has_subquery() {
@@ -716,7 +716,7 @@ impl RelExpr {
         col_id_gen: &ColIdGeneratorRef,
         func: RelExpr,
     ) -> RelExpr {
-        if enabled_rules.enabled(&Rule::Decorrelate) {
+        if enabled_rules.is_enabled(&Rule::Decorrelate) {
             // Not correlated!
             if func.free().is_empty() {
                 return self.join(enabled_rules, col_id_gen, JoinType::CrossJoin, func, vec![]);

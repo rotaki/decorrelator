@@ -19,11 +19,15 @@ impl Rules {
         }
     }
 
-    pub fn add_rule(&self, rule: Rule) {
+    pub fn enable(&self, rule: Rule) {
         self.rules.borrow_mut().insert(rule);
     }
 
-    pub fn enabled(&self, rule: &Rule) -> bool {
+    pub fn disable(&self, rule: Rule) {
+        self.rules.borrow_mut().remove(&rule);
+    }
+
+    pub fn is_enabled(&self, rule: &Rule) -> bool {
         self.rules.borrow().contains(rule)
     }
 }

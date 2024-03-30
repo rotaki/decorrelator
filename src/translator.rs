@@ -46,6 +46,22 @@ impl Environment {
         None
     }
 
+    fn get_at(&self, distance: usize, name: &str) -> Option<usize> {
+        if distance == 0 {
+            if let Some(index) = self.columns.borrow().get(name) {
+                return Some(*index);
+            } else {
+                return None;
+            }
+        }
+
+        if let Some(outer) = &self.outer {
+            return outer.get_at(distance - 1, name);
+        }
+
+        None
+    }
+
     fn set(&self, name: &str, index: usize) {
         self.columns.borrow_mut().insert(name.to_string(), index);
     }
@@ -233,16 +249,16 @@ impl Translator {
         use sqlparser::ast::{JoinConstraint, JoinOperator::*};
         match join_operator {
             Inner(JoinConstraint::On(cond)) => {
-                Ok((JoinType::Inner, Some(self.process_expr(cond)?)))
+                Ok((JoinType::Inner, Some(self.process_expr(cond, None)?)))
             }
             LeftOuter(JoinConstraint::On(cond)) => {
-                Ok((JoinType::LeftOuter, Some(self.process_expr(cond)?)))
+                Ok((JoinType::LeftOuter, Some(self.process_expr(cond, None)?)))
             }
             RightOuter(JoinConstraint::On(cond)) => {
-                Ok((JoinType::RightOuter, Some(self.process_expr(cond)?)))
+                Ok((JoinType::RightOuter, Some(self.process_expr(cond, None)?)))
             }
             FullOuter(JoinConstraint::On(cond)) => {
-                Ok((JoinType::FullOuter, Some(self.process_expr(cond)?)))
+                Ok((JoinType::FullOuter, Some(self.process_expr(cond, None)?)))
             }
             CrossJoin => Ok((JoinType::CrossJoin, None)),
             _ => Err(translation_err!(
@@ -345,7 +361,7 @@ impl Translator {
         where_clause: &Option<sqlparser::ast::Expr>,
     ) -> Result<RelExpr, TranslatorError> {
         if let Some(expr) = where_clause {
-            let expr = self.process_expr(expr)?;
+            let expr = self.process_expr(expr, None)?;
             Ok(plan.select(&self.enabled_rules, &self.col_id_gen, vec![expr]))
         } else {
             Ok(plan)
@@ -376,7 +392,7 @@ impl Translator {
                 }
                 sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
                     if !has_agg(expr) {
-                        let expr = self.process_expr(expr)?;
+                        let expr = self.process_expr(expr, Some(0))?;
                         let col_id = if let Expr::ColRef { id } = expr {
                             id
                         } else {
@@ -418,7 +434,7 @@ impl Translator {
                 sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
                     // create a new col_id for the expression
                     let col_id = if !has_agg(expr) {
-                        let expr = self.process_expr(expr)?;
+                        let expr = self.process_expr(expr, Some(0))?;
                         let col_id = if let Expr::ColRef { id } = expr {
                             id
                         } else {
@@ -490,7 +506,7 @@ impl Translator {
                 sqlparser::ast::GroupByExpr::Expressions(exprs) => {
                     let mut group_by = Vec::new();
                     for expr in exprs {
-                        let expr = self.process_expr(expr)?;
+                        let expr = self.process_expr(expr, Some(0))?;
                         let col_id = if let Expr::ColRef { id } = expr {
                             id
                         } else {
@@ -527,11 +543,13 @@ impl Translator {
         aggs: &mut Vec<(usize, (usize, AggOp))>,
     ) -> (RelExpr, Expr) {
         match expr {
-            sqlparser::ast::Expr::Identifier(_)
-            | sqlparser::ast::Expr::CompoundIdentifier(_)
-            | sqlparser::ast::Expr::Value(_)
-            | sqlparser::ast::Expr::TypedString { .. } => {
-                let expr = self.process_expr(expr).unwrap();
+            sqlparser::ast::Expr::Identifier(_) | sqlparser::ast::Expr::CompoundIdentifier(_) => {
+                unreachable!(
+                    "Identifier and compound identifier should be processed in the Function branch"
+                )
+            }
+            sqlparser::ast::Expr::Value(_) | sqlparser::ast::Expr::TypedString { .. } => {
+                let expr = self.process_expr(expr, Some(0)).unwrap();
                 (plan, expr)
             }
             sqlparser::ast::Expr::BinaryOp { left, op, right } => {
@@ -575,15 +593,10 @@ impl Translator {
                 let agg_col_id = self.col_id_gen.next();
                 match function_arg_expr {
                     sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                        let expr = self.process_expr(&expr).unwrap();
-                        if let Expr::ColRef { id } = expr {
-                            aggs.push((agg_col_id, (id, agg_op)));
-                        } else {
-                            let col_id = self.col_id_gen.next();
-                            plan =
-                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
-                            aggs.push((agg_col_id, (col_id, agg_op)));
-                        }
+                        let expr = self.process_expr(&expr, None).unwrap();
+                        let col_id = self.col_id_gen.next();
+                        plan = plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
+                        aggs.push((agg_col_id, (col_id, agg_op)));
                         (plan, Expr::col_ref(agg_col_id))
                     }
                     sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => {
@@ -614,10 +627,19 @@ impl Translator {
         }
     }
 
-    fn process_expr(&self, expr: &sqlparser::ast::Expr) -> Result<Expr, TranslatorError> {
+    fn process_expr(
+        &self,
+        expr: &sqlparser::ast::Expr,
+        distance: Option<usize>,
+    ) -> Result<Expr, TranslatorError> {
         match expr {
             sqlparser::ast::Expr::Identifier(ident) => {
-                let id = self.env.get(&ident.value).ok_or(translation_err!(
+                let id = if let Some(distance) = distance {
+                    self.env.get_at(distance, &ident.value)
+                } else {
+                    self.env.get(&ident.value)
+                };
+                let id = id.ok_or(translation_err!(
                     ColumnNotFound,
                     "{}, env: {}",
                     ident.value,
@@ -637,7 +659,12 @@ impl Translator {
                     .map(|i| i.value.clone())
                     .collect::<Vec<_>>()
                     .join(".");
-                let id = self.env.get(&name).ok_or(translation_err!(
+                let id = if let Some(distance) = distance {
+                    self.env.get_at(distance, &name)
+                } else {
+                    self.env.get(&name)
+                };
+                let id = id.ok_or(translation_err!(
                     ColumnNotFound,
                     "{}, env: {}",
                     name,
@@ -653,8 +680,8 @@ impl Translator {
             }
             sqlparser::ast::Expr::BinaryOp { left, op, right } => {
                 use sqlparser::ast::BinaryOperator::*;
-                let left = self.process_expr(left)?;
-                let right = self.process_expr(right)?;
+                let left = self.process_expr(left, distance)?;
+                let right = self.process_expr(right, distance)?;
                 let bin_op = match op {
                     And => BinaryOp::And,
                     Or => BinaryOp::Or,
@@ -733,7 +760,7 @@ mod tests {
     use crate::{
         catalog::{Catalog, Column, DataType, Schema, Table},
         col_id_generator::ColIdGenerator,
-        rules::Rules,
+        rules::{Rule, Rules},
         translator::Translator,
     };
 
@@ -790,6 +817,7 @@ mod tests {
     fn get_translator() -> Translator {
         let catalog = Rc::new(get_test_catalog());
         let enabled_rules = Rc::new(Rules::default());
+        // enabled_rules.disable(Rule::Decorrelate);
         let col_id_gen = Rc::new(ColIdGenerator::new());
         Translator::new(&catalog, &enabled_rules, &col_id_gen)
     }
@@ -861,7 +889,13 @@ mod tests {
 
     #[test]
     fn parse_subquery() {
-        let sql = "SELECT a, x, y FROM t1, (SELECT COUNT(*) AS x, SUM(b) as y FROM t2 WHERE c = a)";
+        let sql = "SELECT a, x, y FROM t1, (SELECT COUNT(*) AS x, SUM(c) as y FROM t2 WHERE c = a)";
+        println!("{}", get_plan(sql));
+    }
+
+    #[test]
+    fn parse_subquery_2() {
+        let sql = "SELECT a, x, y FROM t1, (SELECT AVG(b) AS x, SUM(d) as y FROM t2 WHERE c = a)";
         println!("{}", get_plan(sql));
     }
 
