@@ -349,6 +349,8 @@ pub enum RelExpr {
     },
     Map {
         // Appends new columns to the result
+        // This is the only operator that can have a reference to the columns of
+        // the outer scope
         input: Box<RelExpr>,
         exprs: Vec<(usize, Expr)>,
     },
@@ -413,9 +415,14 @@ impl RelExpr {
                     let (push_down, keep): (Vec<_>, Vec<_>) = predicates
                         .into_iter()
                         .partition(|pred| pred.free().is_subset(&group_by_cols));
-                    src.select(enabled_rules, col_id_gen, push_down)
-                        .aggregate(group_by, aggrs)
-                        .select(enabled_rules, col_id_gen, keep)
+                    RelExpr::Select {
+                        src: Box::new(RelExpr::Aggregate {
+                            src: Box::new(src.select(enabled_rules, col_id_gen, push_down)),
+                            group_by,
+                            aggrs,
+                        }),
+                        predicates: keep,
+                    }
                 }
                 RelExpr::Map { input, exprs } => {
                     // If the predicate does not intersect with the atts of exprs, we can push it to the source
@@ -423,10 +430,13 @@ impl RelExpr {
                     let (push_down, keep): (Vec<_>, Vec<_>) = predicates
                         .into_iter()
                         .partition(|pred| pred.free().is_disjoint(&atts));
-                    input
-                        .select(enabled_rules, col_id_gen, push_down)
-                        .map(enabled_rules, col_id_gen, exprs)
-                        .select(enabled_rules, col_id_gen, keep)
+                    RelExpr::Select {
+                        src: Box::new(RelExpr::Map {
+                            input: Box::new(input.select(enabled_rules, col_id_gen, push_down)),
+                            exprs,
+                        }),
+                        predicates: keep,
+                    }
                 }
                 _ => RelExpr::Select {
                     src: Box::new(self),
@@ -1258,35 +1268,36 @@ impl RelExpr {
                 group_by,
                 aggrs,
             } => {
-                out.push_str(&format!("{}-> aggregate(\n", " ".repeat(indent)));
-                out.push_str(&format!("{}    group_by: [", " ".repeat(indent),));
+                out.push_str(&format!("{}-> aggregate(", " ".repeat(indent)));
+                out.push_str(&format!("group_by: [",));
                 let mut split = "";
                 for col in group_by {
                     out.push_str(split);
                     out.push_str(&format!("@{}", col));
                     split = ", ";
                 }
-                out.push_str("],\n");
+                out.push_str("], ");
+                out.push_str(&format!("aggrs: ["));
+                let mut split = "";
                 for (id, (input_id, op)) in aggrs {
-                    out.push_str(&format!(
-                        "{}    @{} <- {}(@{})\n",
-                        " ".repeat(indent),
-                        id,
-                        op,
-                        input_id
-                    ));
+                    out.push_str(split);
+                    out.push_str(&format!("@{} <- {:?}(@{})", id, op, input_id));
+                    split = ", ";
                 }
-                out.push_str(&format!("{})\n", " ".repeat(indent + 2)));
+                out.push_str("]");
+                out.push_str(&format!(")\n"));
                 src.print_inner(indent + 2, out);
             }
             RelExpr::Map { input, exprs } => {
-                out.push_str(&format!("{}-> map(\n", " ".repeat(indent)));
+                out.push_str(&format!("{}-> map(", " ".repeat(indent)));
+                let mut split = "";
                 for (id, expr) in exprs {
-                    out.push_str(&format!("{}    @{} <- ", " ".repeat(indent), id));
-                    expr.print_inner(indent, out);
-                    out.push_str(",\n");
+                    out.push_str(split);
+                    out.push_str(&format!("@{} <- ", id));
+                    expr.print_inner(0, out);
+                    split = ", ";
                 }
-                out.push_str(&format!("{})\n", " ".repeat(indent + 2)));
+                out.push_str(")\n");
                 input.print_inner(indent + 2, out);
             }
             RelExpr::FlatMap { input, func } => {

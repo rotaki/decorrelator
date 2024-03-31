@@ -361,8 +361,25 @@ impl Translator {
         where_clause: &Option<sqlparser::ast::Expr>,
     ) -> Result<RelExpr, TranslatorError> {
         if let Some(expr) = where_clause {
-            let expr = self.process_expr(expr, None)?;
-            Ok(plan.select(&self.enabled_rules, &self.col_id_gen, vec![expr]))
+            match self.process_expr(expr, Some(0)) {
+                Ok(expr) => {
+                    // Search locally
+                    Ok(plan.select(&self.enabled_rules, &self.col_id_gen, vec![expr]))
+                }
+                Err(TranslatorError::ColumnNotFound(_)) => {
+                    // Search globally.
+                    let expr = self.process_expr(expr, None)?;
+                    let col_id = self.col_id_gen.next();
+                    Ok(plan
+                        .map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)])
+                        .select(
+                            &self.enabled_rules,
+                            &self.col_id_gen,
+                            vec![Expr::col_ref(col_id)],
+                        ))
+                }
+                Err(e) => Err(e),
+            }
         } else {
             Ok(plan)
         }
@@ -392,17 +409,36 @@ impl Translator {
                 }
                 sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
                     if !has_agg(expr) {
-                        let expr = self.process_expr(expr, None)?;
-                        let col_id = if let Expr::ColRef { id } = expr {
-                            id
-                        } else {
-                            // create a new col_id for the expression
-                            let col_id = self.col_id_gen.next();
-                            plan =
-                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
-                            col_id
-                        };
-                        projected_cols.insert(col_id);
+                        match self.process_expr(expr, Some(0)) {
+                            Ok(expr) => {
+                                let col_id = if let Expr::ColRef { id } = expr {
+                                    id
+                                } else {
+                                    // create a new col_id for the expression
+                                    let col_id = self.col_id_gen.next();
+                                    plan = plan.map(
+                                        &self.enabled_rules,
+                                        &self.col_id_gen,
+                                        [(col_id, expr)],
+                                    );
+                                    col_id
+                                };
+                                projected_cols.insert(col_id);
+                            }
+                            Err(TranslatorError::ColumnNotFound(_)) => {
+                                // Search globally.
+                                let expr = self.process_expr(expr, None)?;
+                                // Add a map to the plan
+                                let col_id = self.col_id_gen.next();
+                                plan = plan.map(
+                                    &self.enabled_rules,
+                                    &self.col_id_gen,
+                                    [(col_id, expr)],
+                                );
+                                projected_cols.insert(col_id);
+                            }
+                            Err(e) => return Err(e),
+                        }
                     } else {
                         // The most complicated case will be:
                         // Agg(a + b) + Agg(c + d) + 4
@@ -434,15 +470,32 @@ impl Translator {
                 sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
                     // create a new col_id for the expression
                     let col_id = if !has_agg(expr) {
-                        let expr = self.process_expr(expr, None)?;
-                        let col_id = if let Expr::ColRef { id } = expr {
-                            id
-                        } else {
-                            // create a new col_id for the expression
-                            let col_id = self.col_id_gen.next();
-                            plan =
-                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
-                            col_id
+                        let col_id = match self.process_expr(expr, Some(0)) {
+                            Ok(expr) => {
+                                if let Expr::ColRef { id } = expr {
+                                    id
+                                } else {
+                                    let col_id = self.col_id_gen.next();
+                                    plan = plan.map(
+                                        &self.enabled_rules,
+                                        &self.col_id_gen,
+                                        [(col_id, expr)],
+                                    );
+                                    col_id
+                                }
+                            }
+                            Err(TranslatorError::ColumnNotFound(_)) => {
+                                // Search globally.
+                                let expr = self.process_expr(expr, None)?;
+                                let col_id = self.col_id_gen.next();
+                                plan = plan.map(
+                                    &self.enabled_rules,
+                                    &self.col_id_gen,
+                                    [(col_id, expr)],
+                                );
+                                col_id
+                            }
+                            Err(e) => return Err(e),
                         };
                         projected_cols.insert(col_id);
                         col_id
@@ -549,7 +602,7 @@ impl Translator {
                 )
             }
             sqlparser::ast::Expr::Value(_) | sqlparser::ast::Expr::TypedString { .. } => {
-                let expr = self.process_expr(expr, None).unwrap();
+                let expr = self.process_expr(expr, Some(0)).unwrap();
                 (plan, expr)
             }
             sqlparser::ast::Expr::BinaryOp { left, op, right } => {
@@ -593,16 +646,35 @@ impl Translator {
                 let agg_col_id = self.col_id_gen.next();
                 match function_arg_expr {
                     sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                        let expr = self.process_expr(&expr, None).unwrap();
-                        if let Expr::ColRef { id } = expr {
-                            aggs.push((agg_col_id, (id, agg_op)));
-                        } else {
-                            let col_id = self.col_id_gen.next();
-                            plan =
-                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
-                            aggs.push((agg_col_id, (col_id, agg_op)));
+                        match self.process_expr(expr, Some(0)) {
+                            Ok(expr) => {
+                                if let Expr::ColRef { id } = expr {
+                                    aggs.push((agg_col_id, (id, agg_op)));
+                                    (plan, Expr::col_ref(agg_col_id))
+                                } else {
+                                    plan = plan.map(
+                                        &self.enabled_rules,
+                                        &self.col_id_gen,
+                                        [(agg_col_id, expr)],
+                                    );
+                                    aggs.push((agg_col_id, (agg_col_id, agg_op)));
+                                    (plan, Expr::col_ref(agg_col_id))
+                                }
+                            }
+                            Err(TranslatorError::ColumnNotFound(_)) => {
+                                // Search globally.
+                                let expr = self.process_expr(expr, None).unwrap();
+                                let col_id = self.col_id_gen.next();
+                                plan = plan.map(
+                                    &self.enabled_rules,
+                                    &self.col_id_gen,
+                                    [(col_id, expr)],
+                                );
+                                aggs.push((agg_col_id, (col_id, agg_op)));
+                                (plan, Expr::col_ref(agg_col_id))
+                            }
+                            _ => unimplemented!("Unsupported expression: {:?}", expr),
                         }
-                        (plan, Expr::col_ref(agg_col_id))
                     }
                     sqlparser::ast::FunctionArgExpr::QualifiedWildcard(_) => {
                         unimplemented!("QualifiedWildcard is not supported yet")
@@ -822,7 +894,7 @@ mod tests {
     fn get_translator() -> Translator {
         let catalog = Rc::new(get_test_catalog());
         let enabled_rules = Rc::new(Rules::default());
-        // enabled_rules.disable(Rule::Decorrelate);
+        enabled_rules.disable(Rule::Decorrelate);
         // enabled_rules.disable(Rule::ProjectionPushdown);
         let col_id_gen = Rc::new(ColIdGenerator::new());
         Translator::new(&catalog, &enabled_rules, &col_id_gen)
@@ -901,6 +973,7 @@ mod tests {
 
     #[test]
     fn parse_subquery_2() {
+        // This should not make sense because it requires to average b for each b
         let sql = "SELECT a, x, y FROM t1, (SELECT AVG(b) AS x, SUM(d) as y FROM t2 WHERE c = a)";
         println!("{}", get_plan(sql));
     }
