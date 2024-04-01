@@ -239,7 +239,7 @@ impl Expr {
                 out.push_str(" end");
             }
             Expr::Subquery { expr } => {
-                out.push_str("λ.(\n");
+                out.push_str(&format!("λ.{:?}(\n", expr.free()));
                 expr.print_inner(indent + 6, out);
                 out.push_str(&format!("{})", " ".repeat(indent + 4)));
             }
@@ -425,17 +425,47 @@ impl RelExpr {
                     }
                 }
                 RelExpr::Map { input, exprs } => {
+                    // If the map is a->b and a is not free and b is used as a selection, then
+                    // we can replace b with a in the selection
+                    // e.g. if @0 and @1 are bound columns, we can rewrite
+                    // FROM: select(@2).map(@2 <- @1 + @0)
+                    // TO:   select(@1 + @0).map(@2 <- @1 + @0)
+                    for (dest_id, expr) in &exprs {
+                        for pred in &mut predicates {
+                            if matches!(pred, Expr::ColRef { id } if *id == *dest_id) {
+                                if expr.bound_by(&input) {
+                                    // If expr introduces a reference to a column in an outer scope,
+                                    // bound_by becomes false
+                                    *pred = expr.clone();
+                                }
+                            }
+                        }
+                    }
                     // If the predicate does not intersect with the atts of exprs, we can push it to the source
                     let atts = exprs.iter().map(|(id, _)| *id).collect::<HashSet<_>>();
                     let (push_down, keep): (Vec<_>, Vec<_>) = predicates
                         .into_iter()
                         .partition(|pred| pred.free().is_disjoint(&atts));
-                    RelExpr::Select {
-                        src: Box::new(RelExpr::Map {
-                            input: Box::new(input.select(enabled_rules, col_id_gen, push_down)),
-                            exprs,
-                        }),
-                        predicates: keep,
+                    let plan = if push_down.is_empty() {
+                        *input
+                    } else {
+                        input.select(enabled_rules, col_id_gen, push_down)
+                    };
+                    let plan = if exprs.is_empty() {
+                        plan
+                    } else {
+                        RelExpr::Map {
+                            input: Box::new(plan),
+                            exprs: exprs.clone(),
+                        }
+                    };
+                    if keep.is_empty() {
+                        plan
+                    } else {
+                        RelExpr::Select {
+                            src: Box::new(plan),
+                            predicates: keep,
+                        }
                     }
                 }
                 _ => RelExpr::Select {
@@ -566,11 +596,16 @@ impl RelExpr {
                 } => {
                     // Remove the mappings that are not used in the projection.
                     existing_exprs.retain(|(id, _)| cols.contains(id));
-                    RelExpr::Project {
-                        src: Box::new(RelExpr::Map {
+                    let src = if existing_exprs.is_empty() {
+                        *input
+                    } else {
+                        RelExpr::Map {
                             input,
                             exprs: existing_exprs,
-                        }),
+                        }
+                    };
+                    RelExpr::Project {
+                        src: Box::new(src),
                         cols,
                     }
                 }
@@ -704,11 +739,10 @@ impl RelExpr {
                     .into_iter()
                     .partition(|(_, expr)| expr.free().is_disjoint(&atts));
                 existing_exprs.append(&mut push_down);
-                input.map(enabled_rules, col_id_gen, existing_exprs).map(
-                    enabled_rules,
-                    col_id_gen,
-                    keep,
-                )
+                RelExpr::Map {
+                    input: Box::new(input.map(enabled_rules, col_id_gen, existing_exprs)),
+                    exprs: keep,
+                }
             }
             _ => RelExpr::Map {
                 input: Box::new(self),
@@ -1289,15 +1323,13 @@ impl RelExpr {
                 src.print_inner(indent + 2, out);
             }
             RelExpr::Map { input, exprs } => {
-                out.push_str(&format!("{}-> map(", " ".repeat(indent)));
-                let mut split = "";
+                out.push_str(&format!("{}-> map(\n", " ".repeat(indent)));
                 for (id, expr) in exprs {
-                    out.push_str(split);
-                    out.push_str(&format!("@{} <- ", id));
-                    expr.print_inner(0, out);
-                    split = ", ";
+                    out.push_str(&format!("{}    @{} <- ", " ".repeat(indent), id));
+                    expr.print_inner(indent, out);
+                    out.push_str(",\n");
                 }
-                out.push_str(")\n");
+                out.push_str(&format!("{})\n", " ".repeat(indent + 2)));
                 input.print_inner(indent + 2, out);
             }
             RelExpr::FlatMap { input, func } => {

@@ -363,8 +363,27 @@ impl Translator {
         if let Some(expr) = where_clause {
             match self.process_expr(expr, Some(0)) {
                 Ok(expr) => {
-                    // Search locally
-                    Ok(plan.select(&self.enabled_rules, &self.col_id_gen, vec![expr]))
+                    match expr {
+                        Expr::Subquery { expr } => {
+                            if expr.att().len() != 1 {
+                                panic!("Subquery in WHERE clause returns more than one column")
+                            }
+                            // Add map first
+                            let col_id = self.col_id_gen.next();
+                            let plan = plan.map(
+                                &self.enabled_rules,
+                                &self.col_id_gen,
+                                [(col_id, Expr::subquery(*expr))],
+                            );
+                            // Add select
+                            Ok(plan.select(
+                                &self.enabled_rules,
+                                &self.col_id_gen,
+                                vec![Expr::col_ref(col_id)],
+                            ))
+                        }
+                        _ => Ok(plan.select(&self.enabled_rules, &self.col_id_gen, vec![expr])),
+                    }
                 }
                 Err(TranslatorError::ColumnNotFound(_)) => {
                     // Search globally.
@@ -790,6 +809,44 @@ impl Translator {
                     value
                 )),
             },
+            sqlparser::ast::Expr::Exists { subquery, negated } => {
+                let mut translator = Translator::new_with_outer(
+                    &self.catalog_ref,
+                    &self.enabled_rules,
+                    &self.col_id_gen,
+                    &self.env,
+                );
+                let subquery = translator.process_query(subquery)?;
+                let mut plan = subquery.plan;
+                // Add count(*) to the subquery
+                let col_id1 = translator.col_id_gen.next();
+                plan = plan.map(
+                    &translator.enabled_rules,
+                    &translator.col_id_gen,
+                    [(col_id1, Expr::int(1))],
+                );
+                let col_id2 = translator.col_id_gen.next();
+                plan = plan.aggregate(vec![], vec![(col_id2, (col_id1, AggOp::Count))]);
+                // Add count(*) > 0  to the subquery
+                let exists_expr = if *negated {
+                    Expr::binary(BinaryOp::Le, Expr::col_ref(col_id2), Expr::int(0))
+                } else {
+                    Expr::binary(BinaryOp::Gt, Expr::col_ref(col_id2), Expr::int(0))
+                };
+                let col_id3 = self.col_id_gen.next();
+                plan = plan.map(
+                    &translator.enabled_rules,
+                    &translator.col_id_gen,
+                    [(col_id3, exists_expr)],
+                );
+                // Add project count(*) > 0 to the subquery
+                plan = plan.project(
+                    &translator.enabled_rules,
+                    &translator.col_id_gen,
+                    [col_id3].into_iter().collect(),
+                );
+                Ok(Expr::subquery(plan))
+            }
             _ => Err(translation_err!(
                 UnsupportedSQL,
                 "Unsupported expression: {:?}",
@@ -894,7 +951,8 @@ mod tests {
     fn get_translator() -> Translator {
         let catalog = Rc::new(get_test_catalog());
         let enabled_rules = Rc::new(Rules::default());
-        enabled_rules.disable(Rule::Decorrelate);
+        // enabled_rules.disable(Rule::Decorrelate);
+        // enabled_rules.disable(Rule::Hoist);
         // enabled_rules.disable(Rule::ProjectionPushdown);
         let col_id_gen = Rc::new(ColIdGenerator::new());
         Translator::new(&catalog, &enabled_rules, &col_id_gen)
@@ -973,7 +1031,7 @@ mod tests {
 
     #[test]
     fn parse_subquery_2() {
-        // This should not make sense because it requires to average b for each b
+        // This actually makes sense if we consider AVG(b) as AVG(0+b)
         let sql = "SELECT a, x, y FROM t1, (SELECT AVG(b) AS x, SUM(d) as y FROM t2 WHERE c = a)";
         println!("{}", get_plan(sql));
     }
@@ -1008,4 +1066,19 @@ mod tests {
         let sql = "SELECT COUNT(a), SUM(b) FROM t1";
         println!("{}", get_plan(sql));
     }
+
+    #[test]
+    fn parse_subquery_where() {
+        let sql = "SELECT a FROM t1 WHERE exists (SELECT * FROM t2 WHERE c = a)";
+        println!("{}", get_plan(sql));
+    }
 }
+
+// Subquery types
+// 1. Select clause
+//   a. Scalar subquery. A subquery that returns a single row.
+//   b. EXISTS subquery. Subquery can return multiple rows.
+//   c. ANY subquery. Subquery can return multiple rows.
+// 2. From clause
+//   a. Subquery can return multiple rows.
+//
