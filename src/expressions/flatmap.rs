@@ -7,20 +7,29 @@ use std::collections::{HashMap, HashSet};
 impl RelExpr {
     pub fn flatmap(
         self,
+        optimize: bool,
         enabled_rules: &RulesRef,
         col_id_gen: &ColIdGeneratorRef,
         func: RelExpr,
     ) -> RelExpr {
-        if enabled_rules.is_enabled(&Rule::Decorrelate) {
+        if optimize && enabled_rules.is_enabled(&Rule::Decorrelate) {
             // Not correlated!
             if func.free().is_empty() {
-                return self.join(enabled_rules, col_id_gen, JoinType::CrossJoin, func, vec![]);
+                return self.join(
+                    true,
+                    enabled_rules,
+                    col_id_gen,
+                    JoinType::CrossJoin,
+                    func,
+                    vec![],
+                );
             }
 
             // Pull up Project
             if let RelExpr::Project { src, mut cols } = func {
                 cols.extend(self.att());
-                return self.flatmap(enabled_rules, col_id_gen, *src).project(
+                return self.flatmap(true, enabled_rules, col_id_gen, *src).project(
+                    false,
                     enabled_rules,
                     col_id_gen,
                     cols,
@@ -29,7 +38,8 @@ impl RelExpr {
 
             // Pull up Maps
             if let RelExpr::Map { input, exprs } = func {
-                return self.flatmap(enabled_rules, col_id_gen, *input).map(
+                return self.flatmap(true, enabled_rules, col_id_gen, *input).map(
+                    false,
                     enabled_rules,
                     col_id_gen,
                     exprs,
@@ -38,7 +48,8 @@ impl RelExpr {
 
             // Pull up Selects
             if let RelExpr::Select { src, predicates } = func {
-                return self.flatmap(enabled_rules, col_id_gen, *src).select(
+                return self.flatmap(true, enabled_rules, col_id_gen, *src).select(
+                    false,
                     enabled_rules,
                     col_id_gen,
                     predicates,
@@ -72,49 +83,59 @@ impl RelExpr {
                         .chain(att.iter().cloned())
                         .collect();
                     return self
-                        .flatmap(enabled_rules, col_id_gen, *src)
+                        .flatmap(true, enabled_rules, col_id_gen, *src)
                         .aggregate(group_by.into_iter().collect(), aggrs);
                 } else {
                     // Deal with the COUNT BUG
                     let orig = self.clone();
-                    let (mut plan, new_col_ids) = self.rename(&enabled_rules, &col_id_gen);
-                    let new_att = plan.att();
+
+                    // Create a copy of the original plan and rename it. Left join the copy with the src.
+                    // Need to replace the free variables in the src with the new column ids.
+                    let (mut copy, new_col_ids) = self.rename(&enabled_rules, &col_id_gen);
+                    let copy_att = copy.att();
                     let src = src.replace_variables(&new_col_ids);
-                    plan = plan.flatmap(enabled_rules, col_id_gen, src);
-                    plan = plan.aggregate(
-                        group_by
-                            .into_iter()
-                            .chain(new_att.iter().cloned())
-                            .collect(),
-                        aggrs,
-                    );
-                    plan = orig.join(
+                    copy = copy
+                        .flatmap(true, enabled_rules, col_id_gen, src)
+                        .aggregate(
+                            group_by
+                                .into_iter()
+                                .chain(copy_att.iter().cloned())
+                                .collect(),
+                            aggrs,
+                        );
+                    // Join the original plan with the copy with the shared columns.
+                    let plan = orig.join(
+                        false,
                         enabled_rules,
                         col_id_gen,
                         JoinType::LeftOuter,
-                        plan,
+                        copy,
                         new_col_ids
                             .iter()
                             .map(|(src, dest)| Expr::col_ref(*src).eq(Expr::col_ref(*dest)))
                             .collect(),
                     );
+                    // Project the columns except the columns of the copy
                     let att = plan.att();
-                    let project_att = att.difference(&new_att).cloned().collect();
-                    return plan.project(enabled_rules, col_id_gen, project_att).map(
-                        enabled_rules,
-                        col_id_gen,
-                        counts.into_iter().map(|id| {
-                            (
-                                id,
-                                Expr::Case {
-                                    expr: Box::new(Expr::col_ref(id)),
-                                    whens: [(Expr::Field { val: Field::Null }, Expr::int(0))]
-                                        .to_vec(),
-                                    else_expr: Box::new(Expr::col_ref(id)),
-                                },
-                            )
-                        }),
-                    );
+                    let project_att = att.difference(&copy_att).cloned().collect();
+                    return plan
+                        .project(false, enabled_rules, col_id_gen, project_att)
+                        .map(
+                            false,
+                            enabled_rules,
+                            col_id_gen,
+                            counts.into_iter().map(|id| {
+                                (
+                                    id,
+                                    Expr::Case {
+                                        expr: Box::new(Expr::col_ref(id)),
+                                        whens: [(Expr::Field { val: Field::Null }, Expr::int(0))]
+                                            .to_vec(),
+                                        else_expr: Box::new(Expr::col_ref(id)),
+                                    },
+                                )
+                            }),
+                        );
                 }
             }
         }

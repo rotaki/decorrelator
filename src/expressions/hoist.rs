@@ -60,13 +60,17 @@ impl RelExpr {
                 let att = expr.att();
                 assert!(att.len() == 1);
                 let input_col_id = att.iter().next().unwrap();
+                if att.len() != 1 {
+                    panic!("Subquery has more than one column");
+                }
                 // Give the column the name that's expected
                 let rhs: RelExpr = expr.map(
+                    true,
                     enabled_rules,
                     col_id_gen,
                     vec![(id, Expr::col_ref(*input_col_id))],
                 );
-                self.flatmap(enabled_rules, col_id_gen, rhs)
+                self.flatmap(true, enabled_rules, col_id_gen, rhs)
             }
             Expr::Binary { op, left, right } => {
                 // Hoist the left, hoist the right, then perform the binary operation
@@ -76,6 +80,7 @@ impl RelExpr {
                 self.hoist(enabled_rules, col_id_gen, lhs_id, *left)
                     .hoist(enabled_rules, col_id_gen, rhs_id, *right)
                     .map(
+                        true,
                         enabled_rules,
                         col_id_gen,
                         [(
@@ -88,13 +93,14 @@ impl RelExpr {
                         )],
                     )
                     .project(
+                        true,
                         enabled_rules,
                         col_id_gen,
                         att.into_iter().chain([id].into_iter()).collect(),
                     )
             }
             Expr::Field { .. } | Expr::ColRef { .. } => {
-                self.map(enabled_rules, col_id_gen, vec![(id, expr)])
+                self.map(true, enabled_rules, col_id_gen, vec![(id, expr)])
             }
             Expr::Case { .. } => {
                 panic!("Case expression is not supported in hoist")

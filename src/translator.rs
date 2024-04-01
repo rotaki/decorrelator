@@ -189,9 +189,10 @@ impl Translator {
         let (mut plan, _) = join_exprs.remove(0);
         for (join_expr, is_subquery) in join_exprs.into_iter() {
             plan = if is_subquery {
-                plan.flatmap(&self.enabled_rules, &self.col_id_gen, join_expr)
+                plan.flatmap(true, &self.enabled_rules, &self.col_id_gen, join_expr)
             } else {
                 plan.join(
+                    true,
                     &self.enabled_rules,
                     &self.col_id_gen,
                     JoinType::CrossJoin,
@@ -223,14 +224,16 @@ impl Translator {
                         "Unsupported join type with subquery"
                     ));
                 }
-                plan.flatmap(&self.enabled_rules, &self.col_id_gen, right)
+                plan.flatmap(true, &self.enabled_rules, &self.col_id_gen, right)
                     .select(
+                        true,
                         &self.enabled_rules,
                         &self.col_id_gen,
                         condition.into_iter().collect(),
                     )
             } else {
                 plan.join(
+                    true,
                     &self.enabled_rules,
                     &self.col_id_gen,
                     join_type,
@@ -371,18 +374,25 @@ impl Translator {
                             // Add map first
                             let col_id = self.col_id_gen.next();
                             let plan = plan.map(
+                                true,
                                 &self.enabled_rules,
                                 &self.col_id_gen,
                                 [(col_id, Expr::subquery(*expr))],
                             );
                             // Add select
                             Ok(plan.select(
+                                true,
                                 &self.enabled_rules,
                                 &self.col_id_gen,
                                 vec![Expr::col_ref(col_id)],
                             ))
                         }
-                        _ => Ok(plan.select(&self.enabled_rules, &self.col_id_gen, vec![expr])),
+                        _ => Ok(plan.select(
+                            true,
+                            &self.enabled_rules,
+                            &self.col_id_gen,
+                            vec![expr],
+                        )),
                     }
                 }
                 Err(TranslatorError::ColumnNotFound(_)) => {
@@ -390,8 +400,14 @@ impl Translator {
                     let expr = self.process_expr(expr, None)?;
                     let col_id = self.col_id_gen.next();
                     Ok(plan
-                        .map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)])
+                        .map(
+                            true,
+                            &self.enabled_rules,
+                            &self.col_id_gen,
+                            [(col_id, expr)],
+                        )
                         .select(
+                            true,
                             &self.enabled_rules,
                             &self.col_id_gen,
                             vec![Expr::col_ref(col_id)],
@@ -436,6 +452,7 @@ impl Translator {
                                     // create a new col_id for the expression
                                     let col_id = self.col_id_gen.next();
                                     plan = plan.map(
+                                        true,
                                         &self.enabled_rules,
                                         &self.col_id_gen,
                                         [(col_id, expr)],
@@ -450,6 +467,7 @@ impl Translator {
                                 // Add a map to the plan
                                 let col_id = self.col_id_gen.next();
                                 plan = plan.map(
+                                    true,
                                     &self.enabled_rules,
                                     &self.col_id_gen,
                                     [(col_id, expr)],
@@ -496,6 +514,7 @@ impl Translator {
                                 } else {
                                     let col_id = self.col_id_gen.next();
                                     plan = plan.map(
+                                        true,
                                         &self.enabled_rules,
                                         &self.col_id_gen,
                                         [(col_id, expr)],
@@ -508,6 +527,7 @@ impl Translator {
                                 let expr = self.process_expr(expr, None)?;
                                 let col_id = self.col_id_gen.next();
                                 plan = plan.map(
+                                    true,
                                     &self.enabled_rules,
                                     &self.col_id_gen,
                                     [(col_id, expr)],
@@ -584,8 +604,12 @@ impl Translator {
                         } else {
                             // create a new col_id for the expression
                             let col_id = self.col_id_gen.next();
-                            plan =
-                                plan.map(&self.enabled_rules, &self.col_id_gen, [(col_id, expr)]);
+                            plan = plan.map(
+                                true,
+                                &self.enabled_rules,
+                                &self.col_id_gen,
+                                [(col_id, expr)],
+                            );
                             col_id
                         };
                         group_by.push(col_id);
@@ -596,8 +620,8 @@ impl Translator {
             plan = plan.aggregate(group_by, aggregations);
             plan = self.process_where(plan, having)?;
         }
-        plan = plan.map(&self.enabled_rules, &self.col_id_gen, maps); // This map corresponds to the Level3 in the comment above
-        plan = plan.project(&self.enabled_rules, &self.col_id_gen, projected_cols);
+        plan = plan.map(true, &self.enabled_rules, &self.col_id_gen, maps); // This map corresponds to the Level3 in the comment above
+        plan = plan.project(true, &self.enabled_rules, &self.col_id_gen, projected_cols);
         Ok(plan)
     }
 
@@ -672,6 +696,7 @@ impl Translator {
                                     (plan, Expr::col_ref(agg_col_id))
                                 } else {
                                     plan = plan.map(
+                                        true,
                                         &self.enabled_rules,
                                         &self.col_id_gen,
                                         [(agg_col_id, expr)],
@@ -685,6 +710,7 @@ impl Translator {
                                 let expr = self.process_expr(expr, None).unwrap();
                                 let col_id = self.col_id_gen.next();
                                 plan = plan.map(
+                                    true,
                                     &self.enabled_rules,
                                     &self.col_id_gen,
                                     [(col_id, expr)],
@@ -704,6 +730,7 @@ impl Translator {
                         if matches!(agg_op, AggOp::Count) {
                             let col_id = self.col_id_gen.next();
                             plan = plan.map(
+                                true,
                                 &self.enabled_rules,
                                 &self.col_id_gen,
                                 [(col_id, Expr::int(1))],
@@ -821,6 +848,7 @@ impl Translator {
                 // Add count(*) to the subquery
                 let col_id1 = translator.col_id_gen.next();
                 plan = plan.map(
+                    true,
                     &translator.enabled_rules,
                     &translator.col_id_gen,
                     [(col_id1, Expr::int(1))],
@@ -835,12 +863,14 @@ impl Translator {
                 };
                 let col_id3 = self.col_id_gen.next();
                 plan = plan.map(
+                    true,
                     &translator.enabled_rules,
                     &translator.col_id_gen,
                     [(col_id3, exists_expr)],
                 );
                 // Add project count(*) > 0 to the subquery
                 plan = plan.project(
+                    true,
                     &translator.enabled_rules,
                     &translator.col_id_gen,
                     [col_id3].into_iter().collect(),

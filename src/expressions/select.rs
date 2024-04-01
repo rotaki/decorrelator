@@ -6,6 +6,7 @@ use std::collections::HashSet;
 impl RelExpr {
     pub fn select(
         self,
+        optimize: bool,
         enabled_rules: &RulesRef,
         col_id_gen: &ColIdGeneratorRef,
         predicates: Vec<Expr>,
@@ -18,14 +19,14 @@ impl RelExpr {
             .flat_map(|expr| expr.split_conjunction())
             .collect();
 
-        if enabled_rules.is_enabled(&Rule::SelectionPushdown) {
+        if optimize && enabled_rules.is_enabled(&Rule::SelectionPushdown) {
             match self {
                 RelExpr::Select {
                     src,
                     predicates: mut preds,
                 } => {
                     preds.append(&mut predicates);
-                    src.select(enabled_rules, col_id_gen, preds)
+                    src.select(true, enabled_rules, col_id_gen, preds)
                 }
                 RelExpr::Join {
                     join_type,
@@ -34,7 +35,7 @@ impl RelExpr {
                     predicates: mut preds,
                 } => {
                     preds.append(&mut predicates);
-                    left.join(enabled_rules, col_id_gen, join_type, *right, preds)
+                    left.join(true, enabled_rules, col_id_gen, join_type, *right, preds)
                 }
                 RelExpr::Aggregate {
                     src,
@@ -46,14 +47,9 @@ impl RelExpr {
                     let (push_down, keep): (Vec<_>, Vec<_>) = predicates
                         .into_iter()
                         .partition(|pred| pred.free().is_subset(&group_by_cols));
-                    RelExpr::Select {
-                        src: Box::new(RelExpr::Aggregate {
-                            src: Box::new(src.select(enabled_rules, col_id_gen, push_down)),
-                            group_by,
-                            aggrs,
-                        }),
-                        predicates: keep,
-                    }
+                    src.select(true, enabled_rules, col_id_gen, push_down)
+                        .aggregate(group_by, aggrs)
+                        .select(false, enabled_rules, col_id_gen, keep)
                 }
                 RelExpr::Map { input, exprs } => {
                     // If the map is a->b and a is not free and b is used as a selection, then
@@ -77,32 +73,12 @@ impl RelExpr {
                     let (push_down, keep): (Vec<_>, Vec<_>) = predicates
                         .into_iter()
                         .partition(|pred| pred.free().is_disjoint(&atts));
-                    let plan = if push_down.is_empty() {
-                        *input
-                    } else {
-                        input.select(enabled_rules, col_id_gen, push_down)
-                    };
-                    let plan = if exprs.is_empty() {
-                        plan
-                    } else {
-                        RelExpr::Map {
-                            input: Box::new(plan),
-                            exprs: exprs.clone(),
-                        }
-                    };
-                    if keep.is_empty() {
-                        plan
-                    } else {
-                        RelExpr::Select {
-                            src: Box::new(plan),
-                            predicates: keep,
-                        }
-                    }
+                    input
+                        .select(true, enabled_rules, col_id_gen, push_down)
+                        .map(false, enabled_rules, col_id_gen, exprs)
+                        .select(false, enabled_rules, col_id_gen, keep)
                 }
-                _ => RelExpr::Select {
-                    src: Box::new(self),
-                    predicates,
-                },
+                _ => self.select(false, enabled_rules, col_id_gen, predicates),
             }
         } else {
             RelExpr::Select {

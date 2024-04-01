@@ -6,6 +6,7 @@ use std::collections::{HashMap, HashSet};
 impl RelExpr {
     pub fn project(
         self,
+        optimize: bool,
         enabled_rules: &RulesRef,
         col_id_gen: &ColIdGeneratorRef,
         cols: HashSet<usize>,
@@ -14,7 +15,7 @@ impl RelExpr {
             return self;
         }
 
-        if enabled_rules.is_enabled(&Rule::ProjectionPushdown) {
+        if optimize && enabled_rules.is_enabled(&Rule::ProjectionPushdown) {
             match self {
                 RelExpr::Project {
                     src,
@@ -22,10 +23,7 @@ impl RelExpr {
                 } => {
                     // Merge the columns that are projected
                     existing_cols.extend(cols);
-                    RelExpr::Project {
-                        src,
-                        cols: existing_cols,
-                    }
+                    src.project(true, enabled_rules, col_id_gen, existing_cols)
                 }
                 RelExpr::Map {
                     input,
@@ -33,31 +31,18 @@ impl RelExpr {
                 } => {
                     // Remove the mappings that are not used in the projection.
                     existing_exprs.retain(|(id, _)| cols.contains(id));
-                    let src = if existing_exprs.is_empty() {
-                        *input
-                    } else {
-                        RelExpr::Map {
-                            input,
-                            exprs: existing_exprs,
-                        }
-                    };
-                    RelExpr::Project {
-                        src: Box::new(src),
-                        cols,
-                    }
+                    input
+                        .map(true, enabled_rules, col_id_gen, existing_exprs)
+                        .project(false, enabled_rules, col_id_gen, cols)
                 }
                 RelExpr::Select { src, predicates } => {
                     // The necessary columns are the free variables of the predicates and the projection columns
                     let free: HashSet<usize> =
                         predicates.iter().flat_map(|pred| pred.free()).collect();
                     let new_cols = cols.union(&free).cloned().collect();
-                    RelExpr::Project {
-                        src: Box::new(RelExpr::Select {
-                            src: Box::new(src.project(enabled_rules, col_id_gen, new_cols)),
-                            predicates,
-                        }),
-                        cols,
-                    }
+                    src.project(true, enabled_rules, col_id_gen, new_cols)
+                        .select(false, enabled_rules, col_id_gen, predicates)
+                        .project(false, enabled_rules, col_id_gen, cols)
                 }
                 RelExpr::Join {
                     join_type,
@@ -71,15 +56,16 @@ impl RelExpr {
                     let new_cols = cols.union(&free).cloned().collect();
                     let left_proj = left.att().intersection(&new_cols).cloned().collect();
                     let right_proj = right.att().intersection(&new_cols).cloned().collect();
-                    RelExpr::Project {
-                        src: Box::new(RelExpr::Join {
+                    left.project(true, enabled_rules, col_id_gen, left_proj)
+                        .join(
+                            false,
+                            enabled_rules,
+                            col_id_gen,
                             join_type,
-                            left: Box::new(left.project(enabled_rules, col_id_gen, left_proj)),
-                            right: Box::new(right.project(enabled_rules, col_id_gen, right_proj)),
+                            right.project(true, enabled_rules, col_id_gen, right_proj),
                             predicates,
-                        }),
-                        cols,
-                    }
+                        )
+                        .project(false, enabled_rules, col_id_gen, cols)
                 }
                 RelExpr::Rename {
                     src,
@@ -91,16 +77,12 @@ impl RelExpr {
                     let existing_rename_rev: HashMap<usize, usize> = existing_rename
                         .iter()
                         .map(|(src, dest)| (*dest, *src))
-                        .collect();
+                        .collect(); // dest -> src
                     let mut new_cols = HashSet::new();
                     for col in cols {
-                        if let Some(src) = existing_rename_rev.get(&col) {
-                            new_cols.insert(*src);
-                        } else {
-                            new_cols.insert(col);
-                        }
+                        new_cols.insert(existing_rename_rev.get(&col).unwrap_or(&col).clone());
                     }
-                    src.project(enabled_rules, &col_id_gen, new_cols)
+                    src.project(true, enabled_rules, &col_id_gen, new_cols)
                         .rename_to(existing_rename)
                 }
                 RelExpr::Scan {
@@ -108,15 +90,9 @@ impl RelExpr {
                     mut column_names,
                 } => {
                     column_names.retain(|col| cols.contains(col));
-                    RelExpr::Scan {
-                        table_name,
-                        column_names,
-                    }
+                    RelExpr::scan(table_name, column_names)
                 }
-                _ => RelExpr::Project {
-                    src: Box::new(self),
-                    cols,
-                },
+                _ => self.project(false, enabled_rules, col_id_gen, cols),
             }
         } else {
             RelExpr::Project {

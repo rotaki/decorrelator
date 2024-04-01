@@ -6,6 +6,7 @@ use std::collections::HashSet;
 impl RelExpr {
     pub fn map(
         self,
+        optimize: bool,
         enabled_rules: &RulesRef,
         col_id_gen: &ColIdGeneratorRef,
         exprs: impl IntoIterator<Item = (usize, Expr)>,
@@ -16,45 +17,51 @@ impl RelExpr {
             return self;
         }
 
-        if enabled_rules.is_enabled(&Rule::Hoist) {
-            for i in 0..exprs.len() {
-                // Only hoist expressions with subqueries
-                if exprs[i].1.has_subquery() {
-                    let (id, expr) = exprs.swap_remove(i);
-                    return self.map(enabled_rules, col_id_gen, exprs).hoist(
-                        enabled_rules,
-                        col_id_gen,
-                        id,
-                        expr,
-                    );
+        if optimize {
+            if enabled_rules.is_enabled(&Rule::Hoist) {
+                for i in 0..exprs.len() {
+                    // Only hoist expressions with subqueries
+                    if exprs[i].1.has_subquery() {
+                        let (id, expr) = exprs.swap_remove(i);
+                        return self.map(true, enabled_rules, col_id_gen, exprs).hoist(
+                            enabled_rules,
+                            col_id_gen,
+                            id,
+                            expr,
+                        );
+                    }
                 }
             }
-        }
 
-        match self {
-            RelExpr::Map {
-                input,
-                exprs: mut existing_exprs,
-            } => {
-                // If the free variables of the new exprs (exprs) does not intersect with the attrs
-                // of the existing exprs (existing_exprs), then we can push the new exprs to existing_exprs.
-                let atts = existing_exprs
-                    .iter()
-                    .map(|(id, _)| *id)
-                    .collect::<HashSet<_>>();
-                let (mut push_down, keep): (Vec<_>, Vec<_>) = exprs
-                    .into_iter()
-                    .partition(|(_, expr)| expr.free().is_disjoint(&atts));
-                existing_exprs.append(&mut push_down);
+            match self {
                 RelExpr::Map {
-                    input: Box::new(input.map(enabled_rules, col_id_gen, existing_exprs)),
-                    exprs: keep,
+                    input,
+                    exprs: mut existing_exprs,
+                } => {
+                    // If the free variables of the new exprs (exprs) does not intersect with the attrs
+                    // of the existing exprs (existing_exprs), then we can push the new exprs to existing_exprs.
+                    let atts = existing_exprs
+                        .iter()
+                        .map(|(id, _)| *id)
+                        .collect::<HashSet<_>>();
+                    let (mut push_down, keep): (Vec<_>, Vec<_>) = exprs
+                        .into_iter()
+                        .partition(|(_, expr)| expr.free().is_disjoint(&atts));
+                    existing_exprs.append(&mut push_down);
+                    input
+                        .map(true, enabled_rules, col_id_gen, existing_exprs)
+                        .map(false, enabled_rules, col_id_gen, keep)
                 }
+                _ => RelExpr::Map {
+                    input: Box::new(self),
+                    exprs,
+                },
             }
-            _ => RelExpr::Map {
+        } else {
+            RelExpr::Map {
                 input: Box::new(self),
                 exprs,
-            },
+            }
         }
     }
 }
