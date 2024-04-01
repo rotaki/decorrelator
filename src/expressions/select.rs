@@ -55,8 +55,8 @@ impl RelExpr {
                     // If the map is a->b and a is not free and b is used as a selection, then
                     // we can replace b with a in the selection
                     // e.g. if @0 and @1 are bound columns, we can rewrite
-                    // FROM: select(@2).map(@2 <- @1 + @0)
-                    // TO:   select(@1 + @0).map(@2 <- @1 + @0)
+                    // FROM: select(@2) <- map(@2 <- @1 + @0)
+                    // TO:   select(@1 + @0) <- map(@2 <- @1 + @0)
                     for (dest_id, expr) in &exprs {
                         for pred in &mut predicates {
                             if matches!(pred, Expr::ColRef { id } if *id == *dest_id) {

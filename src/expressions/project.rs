@@ -36,7 +36,12 @@ impl RelExpr {
                         .flat_map(|(_, expr)| expr.free())
                         .collect();
                     free = free.difference(&outer_refs).cloned().collect();
-                    let new_cols = cols.union(&free).cloned().collect();
+                    // From the cols, remove the cols that is created by the map expressions
+                    let mut new_cols: HashSet<usize> = cols.union(&free).cloned().collect();
+                    new_cols = new_cols
+                        .difference(&existing_exprs.iter().map(|(id, _)| *id).collect())
+                        .cloned()
+                        .collect();
 
                     input
                         .project(true, enabled_rules, col_id_gen, new_cols)

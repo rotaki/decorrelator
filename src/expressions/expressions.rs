@@ -194,6 +194,45 @@ impl Expr {
         }
     }
 
+    pub(crate) fn replace_variables_with_exprs(self, src_to_dest: &HashMap<usize, Expr>) -> Expr {
+        match self {
+            Expr::ColRef { id } => {
+                if let Some(expr) = src_to_dest.get(&id) {
+                    expr.clone()
+                } else {
+                    Expr::ColRef { id }
+                }
+            }
+            Expr::Field { val } => Expr::Field { val },
+            Expr::Binary { op, left, right } => Expr::Binary {
+                op,
+                left: Box::new(left.replace_variables_with_exprs(src_to_dest)),
+                right: Box::new(right.replace_variables_with_exprs(src_to_dest)),
+            },
+            Expr::Case {
+                expr,
+                whens,
+                else_expr,
+            } => Expr::Case {
+                expr: Box::new(expr.replace_variables_with_exprs(src_to_dest)),
+                whens: whens
+                    .into_iter()
+                    .map(|(when, then)| {
+                        (
+                            when.replace_variables_with_exprs(src_to_dest),
+                            then.replace_variables_with_exprs(src_to_dest),
+                        )
+                    })
+                    .collect(),
+                else_expr: Box::new(else_expr.replace_variables_with_exprs(src_to_dest)),
+            },
+            Expr::Subquery { expr } => Expr::Subquery {
+                // Do nothing for subquery
+                expr,
+            },
+        }
+    }
+
     pub fn pretty_print(&self) {
         println!("{}", self.pretty_string());
     }

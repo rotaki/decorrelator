@@ -1,7 +1,6 @@
 use super::prelude::*;
 use crate::col_id_generator::ColIdGeneratorRef;
 use crate::rules::{Rule, RulesRef};
-use std::collections::HashSet;
 
 impl RelExpr {
     pub fn map(
@@ -38,24 +37,31 @@ impl RelExpr {
                     input,
                     exprs: mut existing_exprs,
                 } => {
-                    // If the free variables of the new exprs (exprs) does not intersect with the attrs
-                    // of the existing exprs (existing_exprs), then we can push the new exprs to existing_exprs.
-                    let atts = existing_exprs
-                        .iter()
-                        .map(|(id, _)| *id)
-                        .collect::<HashSet<_>>();
-                    let (mut push_down, keep): (Vec<_>, Vec<_>) = exprs
-                        .into_iter()
-                        .partition(|(_, expr)| expr.free().is_disjoint(&atts));
-                    existing_exprs.append(&mut push_down);
-                    input
-                        .map(true, enabled_rules, col_id_gen, existing_exprs)
-                        .map(false, enabled_rules, col_id_gen, keep)
+                    // We can combine two maps into one by merging the expressions.
+                    // FROM: map(@2 <- @1) <- map(@1 <- @0 + 5)
+                    // TO: map(@2 <- @0 + 5, @1 <- @0 + 5)
+                    // If there is a subquery, then it should have already been hoisted.
+                    #[cfg(debug_assertions)]
+                    {
+                        // Check that none of the expressions have subqueries
+                        for (_, expr) in &existing_exprs {
+                            assert!(!expr.has_subquery());
+                        }
+                        for (_, expr) in &exprs {
+                            assert!(!expr.has_subquery());
+                        }
+                    }
+
+                    // Merge the expressions
+                    for (dest, mut expr) in exprs {
+                        expr = expr.replace_variables_with_exprs(
+                            &existing_exprs.iter().cloned().collect(),
+                        );
+                        existing_exprs.push((dest, expr));
+                    }
+                    input.map(true, enabled_rules, col_id_gen, existing_exprs)
                 }
-                _ => RelExpr::Map {
-                    input: Box::new(self),
-                    exprs,
-                },
+                _ => self.map(false, enabled_rules, col_id_gen, exprs),
             }
         } else {
             RelExpr::Map {
