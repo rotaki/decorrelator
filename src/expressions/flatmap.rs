@@ -29,7 +29,7 @@ impl RelExpr {
             if let RelExpr::Project { src, mut cols } = func {
                 cols.extend(self.att());
                 return self.flatmap(true, enabled_rules, col_id_gen, *src).project(
-                    false,
+                    true,
                     enabled_rules,
                     col_id_gen,
                     cols,
@@ -39,7 +39,7 @@ impl RelExpr {
             // Pull up Maps
             if let RelExpr::Map { input, exprs } = func {
                 return self.flatmap(true, enabled_rules, col_id_gen, *input).map(
-                    false,
+                    true,
                     enabled_rules,
                     col_id_gen,
                     exprs,
@@ -49,7 +49,7 @@ impl RelExpr {
             // Pull up Selects
             if let RelExpr::Select { src, predicates } = func {
                 return self.flatmap(true, enabled_rules, col_id_gen, *src).select(
-                    false,
+                    true,
                     enabled_rules,
                     col_id_gen,
                     predicates,
@@ -105,7 +105,7 @@ impl RelExpr {
                         );
                     // Join the original plan with the copy with the shared columns.
                     let plan = orig.join(
-                        false,
+                        true,
                         enabled_rules,
                         col_id_gen,
                         JoinType::LeftOuter,
@@ -119,9 +119,9 @@ impl RelExpr {
                     let att = plan.att();
                     let project_att = att.difference(&copy_att).cloned().collect();
                     return plan
-                        .project(false, enabled_rules, col_id_gen, project_att)
+                        .project(true, enabled_rules, col_id_gen, project_att)
                         .map(
-                            false,
+                            true,
                             enabled_rules,
                             col_id_gen,
                             counts.into_iter().map(|id| {

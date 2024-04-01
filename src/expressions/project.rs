@@ -15,23 +15,31 @@ impl RelExpr {
             return self;
         }
 
+        let outer_refs = self.free();
+
         if optimize && enabled_rules.is_enabled(&Rule::ProjectionPushdown) {
             match self {
                 RelExpr::Project {
                     src,
-                    cols: mut existing_cols,
-                } => {
-                    // Merge the columns that are projected
-                    existing_cols.extend(cols);
-                    src.project(true, enabled_rules, col_id_gen, existing_cols)
-                }
+                    cols: _no_need_cols,
+                } => src.project(true, enabled_rules, col_id_gen, cols),
                 RelExpr::Map {
                     input,
                     exprs: mut existing_exprs,
                 } => {
                     // Remove the mappings that are not used in the projection.
                     existing_exprs.retain(|(id, _)| cols.contains(id));
+                    // Pushdown the projection to the source. Note that we don't push
+                    // down the projection of outer columns.
+                    let mut free: HashSet<usize> = existing_exprs
+                        .iter()
+                        .flat_map(|(_, expr)| expr.free())
+                        .collect();
+                    free = free.difference(&outer_refs).cloned().collect();
+                    let new_cols = cols.union(&free).cloned().collect();
+
                     input
+                        .project(true, enabled_rules, col_id_gen, new_cols)
                         .map(true, enabled_rules, col_id_gen, existing_exprs)
                         .project(false, enabled_rules, col_id_gen, cols)
                 }
@@ -41,7 +49,7 @@ impl RelExpr {
                         predicates.iter().flat_map(|pred| pred.free()).collect();
                     let new_cols = cols.union(&free).cloned().collect();
                     src.project(true, enabled_rules, col_id_gen, new_cols)
-                        .select(false, enabled_rules, col_id_gen, predicates)
+                        .select(true, enabled_rules, col_id_gen, predicates)
                         .project(false, enabled_rules, col_id_gen, cols)
                 }
                 RelExpr::Join {
@@ -58,7 +66,7 @@ impl RelExpr {
                     let right_proj = right.att().intersection(&new_cols).cloned().collect();
                     left.project(true, enabled_rules, col_id_gen, left_proj)
                         .join(
-                            false,
+                            true,
                             enabled_rules,
                             col_id_gen,
                             join_type,
