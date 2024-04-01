@@ -40,6 +40,9 @@ impl RelExpr {
                     // We can combine two maps into one by merging the expressions.
                     // FROM: map(@2 <- @1) <- map(@1 <- @0 + 5)
                     // TO: map(@2 <- @0 + 5, @1 <- @0 + 5)
+                    // This is beneficial because we can now pushdown projections
+                    // and remove the intermediate map if it is not needed. For example,
+                    // if the projection is on @2, we can remove the first map to @1.
                     // If there is a subquery, then it should have already been hoisted.
                     #[cfg(debug_assertions)]
                     {
