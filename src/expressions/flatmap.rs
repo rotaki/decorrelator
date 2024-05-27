@@ -128,7 +128,7 @@ impl RelExpr {
                                 (
                                     id,
                                     Expr::Case {
-                                        expr: Box::new(Expr::col_ref(id)),
+                                        expr: Some(Box::new(Expr::col_ref(id))),
                                         whens: [(Expr::Field { val: Field::Null }, Expr::int(0))]
                                             .to_vec(),
                                         else_expr: Box::new(Expr::col_ref(id)),

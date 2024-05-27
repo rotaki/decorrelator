@@ -8,6 +8,7 @@ use crate::{
     catalog::{self, Catalog, CatalogRef},
     col_id_generator::ColIdGeneratorRef,
     expressions::prelude::*,
+    field::Field,
     rules::RulesRef,
 };
 
@@ -678,10 +679,14 @@ impl Translator {
                     "MAX" => AggOp::Max,
                     _ => unimplemented!("Unsupported aggregation function: {:?}", function),
                 };
-                if function.args.len() != 1 {
+                let args = match &function.args {
+                    sqlparser::ast::FunctionArguments::List(args) => &args.args,
+                    _ => unimplemented!("Unsupported aggregation function: {:?}", function),
+                };
+                if args.len() != 1 {
                     unimplemented!("Unsupported aggregation function: {:?}", function);
                 }
-                let function_arg_expr = match &function.args[0] {
+                let function_arg_expr = match &args[0] {
                     sqlparser::ast::FunctionArg::Named { arg, .. } => arg,
                     sqlparser::ast::FunctionArg::Unnamed(arg) => arg,
                 };
@@ -689,7 +694,7 @@ impl Translator {
                 let agg_col_id = self.col_id_gen.next();
                 match function_arg_expr {
                     sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                        match self.process_expr(expr, Some(0)) {
+                        match self.process_expr(&expr, Some(0)) {
                             Ok(expr) => {
                                 if let Expr::ColRef { id } = expr {
                                     aggs.push((agg_col_id, (id, agg_op)));
@@ -707,7 +712,7 @@ impl Translator {
                             }
                             Err(TranslatorError::ColumnNotFound(_)) => {
                                 // Search globally.
-                                let expr = self.process_expr(expr, None).unwrap();
+                                let expr = self.process_expr(&expr, None).unwrap();
                                 let col_id = self.col_id_gen.next();
                                 plan = plan.map(
                                     true,
@@ -868,13 +873,138 @@ impl Translator {
                     &translator.col_id_gen,
                     [(col_id3, exists_expr)],
                 );
-                // Add project count(*) > 0 to the subquery
+                // Add project col 'count(*) > 0' to the subquery
                 plan = plan.project(
                     true,
                     &translator.enabled_rules,
                     &translator.col_id_gen,
                     [col_id3].into_iter().collect(),
                 );
+                Ok(Expr::subquery(plan))
+            }
+            sqlparser::ast::Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+            } => {
+                let left = self.process_expr(left, distance)?;
+                let right = self.process_expr(right, distance)?;
+                let bin_op = match compare_op {
+                    sqlparser::ast::BinaryOperator::Eq => BinaryOp::Eq,
+                    sqlparser::ast::BinaryOperator::NotEq => BinaryOp::Neq,
+                    sqlparser::ast::BinaryOperator::Lt => BinaryOp::Lt,
+                    sqlparser::ast::BinaryOperator::Gt => BinaryOp::Gt,
+                    sqlparser::ast::BinaryOperator::LtEq => BinaryOp::Le,
+                    sqlparser::ast::BinaryOperator::GtEq => BinaryOp::Ge,
+                    _ => {
+                        unreachable!()
+                    }
+                };
+                match right {
+                    Expr::Subquery { expr } => {
+                        let mut plan = *expr;
+                        let att = plan.att();
+                        if att.len() != 1 {
+                            panic!("Subquery in ANY should return only one column")
+                        }
+                        let col_id = att.iter().next().unwrap();
+                        // Super dirty hack to deal with ANY subquery without introducing a new join rule (mark join)
+                        // First, we append two columns to the result of the subquery
+                        // Expr::int(1) and the result of the binary operation
+                        let col_id0 = self.col_id_gen.next();
+                        let col_id1 = self.col_id_gen.next();
+                        // Case when col is NULL then MIN_INT/2 (Large negative number)
+                        //      when left is NULL then MIN_INT/4 (Second large negative number)
+                        //      when (left bin_op col) then 1
+                        //      else 0
+                        let case_expr1 = Expr::Case {
+                            expr: None,
+                            whens: vec![
+                                (
+                                    Expr::col_ref(*col_id).eq(Expr::null()),
+                                    Expr::int(i64::MIN / 2),
+                                ),
+                                (left.clone().eq(Expr::null()), Expr::int(i64::MIN / 4)),
+                                (
+                                    Expr::binary(bin_op, left, Expr::col_ref(*col_id)),
+                                    Expr::int(1),
+                                ),
+                            ],
+                            else_expr: Box::new(Expr::int(0)),
+                        };
+                        plan = plan.map(
+                            true,
+                            &self.enabled_rules,
+                            &self.col_id_gen,
+                            [(col_id0, Expr::int(1)), (col_id1, case_expr1)],
+                        );
+                        // Take the count, max, min of the columns
+                        let col_id2 = self.col_id_gen.next();
+                        let col_id3 = self.col_id_gen.next();
+                        let col_id4 = self.col_id_gen.next();
+                        plan = plan.aggregate(
+                            vec![],
+                            vec![
+                                (col_id2, (col_id0, AggOp::Count)),
+                                (col_id3, (col_id1, AggOp::Max)),
+                                (col_id4, (col_id1, AggOp::Min)),
+                            ],
+                        );
+                        // Case when count(1) == 0 then FALSE
+                        //      when max == 1 then TRUE
+                        //      when min == MIN_INT/2 then NULL
+                        //      when min == MIN_INT/4 then NULL
+                        //      else FALSE
+                        let case_expr2 = Expr::Case {
+                            expr: None,
+                            whens: vec![
+                                (Expr::col_ref(col_id2).eq(Expr::int(0)), Expr::bool(false)),
+                                (Expr::col_ref(col_id3).eq(Expr::int(1)), Expr::bool(true)),
+                                (
+                                    Expr::col_ref(col_id4).eq(Expr::int(i64::MIN / 2)),
+                                    Expr::null(),
+                                ),
+                                (
+                                    Expr::col_ref(col_id4).eq(Expr::int(i64::MIN / 4)),
+                                    Expr::null(),
+                                ),
+                            ],
+                            else_expr: Box::new(Expr::int(0)),
+                        };
+                        let col_id5 = self.col_id_gen.next();
+                        plan = plan
+                            .map(
+                                true,
+                                &self.enabled_rules,
+                                &self.col_id_gen,
+                                [(col_id5, case_expr2)],
+                            )
+                            .project(
+                                true,
+                                &self.enabled_rules,
+                                &self.col_id_gen,
+                                [col_id5].into_iter().collect(),
+                            );
+                        Ok(Expr::subquery(plan))
+                    }
+                    _ => {
+                        unimplemented!("AnyOp should have a subquery on the right side")
+                    }
+                }
+            }
+            sqlparser::ast::Expr::Subquery(query) => {
+                let mut translator = Translator::new_with_outer(
+                    &self.catalog_ref,
+                    &self.enabled_rules,
+                    &self.col_id_gen,
+                    &self.env,
+                );
+                let subquery = translator.process_query(query)?;
+                let plan = subquery.plan;
+                let att = plan.att();
+                if att.len() != 1 {
+                    panic!("Subquery returns more than one column")
+                }
                 Ok(Expr::subquery(plan))
             }
             _ => Err(translation_err!(
@@ -921,6 +1051,8 @@ fn has_agg(expr: &sqlparser::ast::Expr) -> bool {
 mod tests {
     use std::rc::Rc;
 
+    use sqlparser::dialect::{DuckDbDialect, PostgreSqlDialect};
+
     use crate::{
         catalog::{Catalog, Column, DataType, Schema, Table},
         col_id_generator::ColIdGenerator,
@@ -961,7 +1093,7 @@ mod tests {
         use sqlparser::dialect::GenericDialect;
         use sqlparser::parser::Parser;
 
-        let dialect = GenericDialect {};
+        let dialect = DuckDbDialect {};
         let statements = Parser::new(&dialect)
             .try_with_sql(&sql)
             .unwrap()
@@ -1102,6 +1234,12 @@ mod tests {
         let sql = "SELECT a FROM t1 WHERE exists (SELECT * FROM t2 WHERE c = a)";
         println!("{}", get_plan(sql));
     }
+
+    // #[test]
+    // fn parse_subquery_where_any() {
+    //     let sql = "SELECT * FROM t1 WHERE a IN (SELECT * FROM t2 WHERE c = a)";
+    //     println!("{}", get_plan(sql));
+    // }
 }
 
 // Subquery types

@@ -76,7 +76,7 @@ pub enum Expr {
         right: Box<Expr>,
     },
     Case {
-        expr: Box<Expr>,
+        expr: Option<Box<Expr>>,
         whens: Vec<(Expr, Expr)>,
         else_expr: Box<Expr>,
     },
@@ -96,6 +96,16 @@ impl Expr {
         }
     }
 
+    pub fn bool(val: bool) -> Expr {
+        Expr::Field {
+            val: Field::Bool(val),
+        }
+    }
+
+    pub fn null() -> Expr {
+        Expr::Field { val: Field::Null }
+    }
+
     pub fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
         Expr::Binary {
             op,
@@ -107,6 +117,14 @@ impl Expr {
     pub fn eq(self, other: Expr) -> Expr {
         Expr::Binary {
             op: BinaryOp::Eq,
+            left: Box::new(self),
+            right: Box::new(other),
+        }
+    }
+
+    pub fn gt(self, other: Expr) -> Expr {
+        Expr::Binary {
+            op: BinaryOp::Gt,
             left: Box::new(self),
             right: Box::new(other),
         }
@@ -176,7 +194,7 @@ impl Expr {
                 whens,
                 else_expr,
             } => Expr::Case {
-                expr: Box::new(expr.replace_variables(src_to_dest)),
+                expr: expr.map(|expr| Box::new(expr.replace_variables(src_to_dest))),
                 whens: whens
                     .into_iter()
                     .map(|(when, then)| {
@@ -214,7 +232,7 @@ impl Expr {
                 whens,
                 else_expr,
             } => Expr::Case {
-                expr: Box::new(expr.replace_variables_with_exprs(src_to_dest)),
+                expr: expr.map(|expr| Box::new(expr.replace_variables_with_exprs(src_to_dest))),
                 whens: whens
                     .into_iter()
                     .map(|(when, then)| {
@@ -262,7 +280,7 @@ impl Expr {
                 else_expr,
             } => {
                 out.push_str("case ");
-                expr.print_inner(indent, out);
+                expr.as_ref().map(|expr| expr.print_inner(indent, out));
                 for (when, then) in whens {
                     out.push_str(" when ");
                     when.print_inner(indent, out);
@@ -313,7 +331,10 @@ impl Expr {
                 whens,
                 else_expr,
             } => {
-                let mut set = expr.free();
+                let mut set = expr
+                    .as_ref()
+                    .map(|expr| expr.free())
+                    .unwrap_or(HashSet::new());
                 for (when, then) in whens {
                     set.extend(when.free());
                     set.extend(then.free());
